@@ -6,7 +6,7 @@ import json
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
-from typing import Any, TYPE_CHECKING, Callable, Final, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, Final, Optional, Union
 
 import jinja2
 import partial_json_parser
@@ -343,11 +343,11 @@ class OpenAIServingChat(OpenAIServing):
                         engine_request,
                         sampling_params,
                         request_id,
-                        prompt_str,
                         lora_request=lora_request,
-                        tokenization_kwargs=tokenization_kwargs,
                         trace_headers=trace_headers,
                         priority=request.priority,
+                        prompt_str=prompt_str,
+                        tokenization_kwargs=tokenization_kwargs,
                     )
 
                 generators.append(generator)
