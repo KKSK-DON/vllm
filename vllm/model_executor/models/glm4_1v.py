@@ -28,7 +28,7 @@
 
 import itertools
 import math
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from functools import partial
 from typing import Annotated, Any, Literal, TypeAlias
 
@@ -1576,11 +1576,63 @@ class Glm4vForConditionalGeneration(
                 multimodal_embeddings += tuple(video_embeddings)
         return multimodal_embeddings
 
+    def _iter_mm_grid_thw(
+        self, mm_features: list[MultiModalFeatureSpec]
+    ) -> Iterator[tuple[int, int, int, int]]:
+        hf_config = self.config
+        spatial_merge_size = hf_config.vision_config.spatial_merge_size
+        for mm_feature in sorted(mm_features, key=lambda f: f.mm_position.offset):
+            offset = mm_feature.mm_position.offset
+            if mm_feature.modality == "image":
+                t, h, w = mm_feature.data["image_grid_thw"].data.tolist()
+                assert t == 1, f"Image must have 1 frame, got {t}"
+                yield offset, t, h // spatial_merge_size, w // spatial_merge_size
+            elif mm_feature.modality == "video":
+                t, h, w = mm_feature.data["video_grid_thw"].data.tolist()
+                yield offset, t, h // spatial_merge_size, w // spatial_merge_size
+            else:
+                raise ValueError(f"Unsupported modality: {mm_feature.modality}")
+
     def get_mrope_input_positions(
         self,
         input_tokens: list[int],
         mm_features: list[MultiModalFeatureSpec],
     ) -> tuple[torch.Tensor, int]:
+        def test():
+            llm_pos_ids_list: list = []
+            st = 0
+            for (
+                offset,
+                llm_grid_t,
+                llm_grid_h,
+                llm_grid_w,
+            ) in self._iter_mm_grid_thw(mm_features):
+                text_len = offset - st
+                st_idx = (
+                    llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
+                )
+                llm_pos_ids_list.append(
+                    np.broadcast_to(np.arange(text_len), (3, text_len)) + st_idx
+                )
+                grid_indices = np.indices((llm_grid_t, llm_grid_h, llm_grid_w)).reshape(
+                    3, -1
+                )
+                llm_pos_ids_list.append(grid_indices + text_len + st_idx)
+                st = offset + llm_grid_t * llm_grid_h * llm_grid_w
+
+            if st < len(input_tokens):
+                text_len = len(input_tokens) - st
+                st_idx = (
+                    llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
+                )
+                llm_pos_ids_list.append(
+                    np.broadcast_to(np.arange(text_len), (3, text_len)) + st_idx
+                )
+            llm_positions = np.concatenate(llm_pos_ids_list, axis=1).reshape(3, -1)
+            mrope_position_delta = (llm_positions.max() + 1 - len(input_tokens)).item()
+            return torch.from_numpy(llm_positions), mrope_position_delta
+
+        verify_llm_positions, verify_mrope_delta = test()
         kwargs = MultiModalFeatureSpec.gather_kwargs(
             mm_features,
             {"image_grid_thw", "video_grid_thw"},
@@ -1707,6 +1759,53 @@ class Glm4vForConditionalGeneration(
 
         llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
         mrope_position_delta = (llm_positions.max() + 1 - len(input_tokens)).item()
+
+        # Compare the two implementations
+        positions_match = torch.equal(verify_llm_positions, llm_positions)
+        delta_match = verify_mrope_delta == mrope_position_delta
+
+        if not positions_match or not delta_match:
+            logger.warning("=" * 60)
+            logger.warning("MROPE POSITION MISMATCH DETECTED!")
+            logger.warning("=" * 60)
+            logger.warning("Delta match: %s", delta_match)
+            logger.warning("  - test() delta: %s", verify_mrope_delta)
+            logger.warning("  - main delta:   %s", mrope_position_delta)
+            logger.warning("Positions match: %s", positions_match)
+            logger.warning("  - test() shape: %s", verify_llm_positions.shape)
+            logger.warning("  - main shape:   %s", llm_positions.shape)
+
+            if verify_llm_positions.shape == llm_positions.shape:
+                diff_mask = verify_llm_positions != llm_positions
+                num_diffs = diff_mask.sum().item()
+                logger.warning("  - Number of differing elements: %s", num_diffs)
+
+                if num_diffs > 0 and num_diffs <= 20:
+                    diff_indices = torch.nonzero(diff_mask, as_tuple=False)
+                    for idx in diff_indices:
+                        dim, pos = idx[0].item(), idx[1].item()
+                        logger.warning(
+                            "    Diff at [%s,%s]: test()=%s vs main=%s",
+                            dim,
+                            pos,
+                            verify_llm_positions[dim, pos].item(),
+                            llm_positions[dim, pos].item(),
+                        )
+                elif num_diffs > 20:
+                    logger.warning("    (Too many differences to display)")
+            else:
+                logger.warning("  - Shapes differ, cannot compare element-wise")
+                logger.warning("  - test() positions:\n%s", verify_llm_positions)
+                logger.warning("  - main positions:\n%s", llm_positions)
+            logger.warning("=" * 60)
+        else:
+            logger.debug(
+                "MROPE positions verified: Both implementations match "
+                "(shape=%s, delta=%s)",
+                llm_positions.shape,
+                mrope_position_delta,
+            )
+
         return llm_positions, mrope_position_delta
 
     def forward(
