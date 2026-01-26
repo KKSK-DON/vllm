@@ -1237,11 +1237,8 @@ def load_glm4_1v(question: str, image_urls: list[str]) -> ModelRequestData:
 
     engine_args = EngineArgs(
         model=model_name,
-        max_model_len=4096,
+        max_model_len=45082,
         max_num_seqs=2,
-        mm_processor_kwargs={
-            "size": {"shortest_edge": 12544, "longest_edge": 47040000},
-        },
         limit_mm_per_prompt={"image": len(image_urls)},
         enforce_eager=True,
     )
