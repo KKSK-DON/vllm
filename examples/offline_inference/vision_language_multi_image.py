@@ -1231,6 +1231,45 @@ def load_tarsier2(question: str, image_urls: list[str]) -> ModelRequestData:
     )
 
 
+# GLM-4.1V
+def load_glm4_1v(question: str, image_urls: list[str]) -> ModelRequestData:
+    model_name = "zai-org/GLM-4.1V-9B-Thinking"
+
+    engine_args = EngineArgs(
+        model=model_name,
+        max_model_len=4096,
+        max_num_seqs=2,
+        mm_processor_kwargs={
+            "size": {"shortest_edge": 12544, "longest_edge": 47040000},
+        },
+        limit_mm_per_prompt={"image": len(image_urls)},
+        enforce_eager=True,
+    )
+
+    placeholders = [{"type": "image", "image": url} for url in image_urls]
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                *placeholders,
+                {"type": "text", "text": question},
+            ],
+        }
+    ]
+
+    processor = AutoProcessor.from_pretrained(model_name)
+    prompt = processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    image_data = [fetch_image(url) for url in image_urls]
+
+    return ModelRequestData(
+        engine_args=engine_args,
+        prompt=prompt,
+        image_data=image_data,
+    )
+
+
 # GLM-4.5V
 def load_glm4_5v(question: str, image_urls: list[str]) -> ModelRequestData:
     model_name = "zai-org/GLM-4.5V"
@@ -1376,6 +1415,7 @@ model_example_map = {
     "step3": load_step3,
     "tarsier": load_tarsier,
     "tarsier2": load_tarsier2,
+    "glm4_1v": load_glm4_1v,
     "glm4_5v": load_glm4_5v,
     "glm4_5v_fp8": load_glm4_5v_fp8,
 }
