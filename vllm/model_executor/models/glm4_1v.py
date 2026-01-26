@@ -1776,27 +1776,41 @@ class Glm4vForConditionalGeneration(
             logger.warning("  - main shape:   %s", llm_positions.shape)
 
             if verify_llm_positions.shape == llm_positions.shape:
-                diff_mask = verify_llm_positions != llm_positions
+                diff_mask = (verify_llm_positions != llm_positions).any(dim=0)
                 num_diffs = diff_mask.sum().item()
-                logger.warning("  - Number of differing elements: %s", num_diffs)
+                logger.warning("  - Number of differing columns: %s", num_diffs)
 
-                if num_diffs > 0 and num_diffs <= 20:
-                    diff_indices = torch.nonzero(diff_mask, as_tuple=False)
-                    for idx in diff_indices:
-                        dim, pos = idx[0].item(), idx[1].item()
-                        logger.warning(
-                            "    Diff at [%s,%s]: test()=%s vs main=%s",
-                            dim,
-                            pos,
-                            verify_llm_positions[dim, pos].item(),
-                            llm_positions[dim, pos].item(),
-                        )
-                elif num_diffs > 20:
-                    logger.warning("    (Too many differences to display)")
+                if num_diffs > 0:
+                    start_idx = torch.nonzero(diff_mask, as_tuple=False)[0].item()
+                    end_idx = min(start_idx + 20, llm_positions.shape[1])
+                    logger.warning(
+                        "  - First diff at column %s, showing slice [%s:%s]:",
+                        start_idx,
+                        start_idx,
+                        end_idx,
+                    )
+                    logger.warning(
+                        "  - test() positions[:, %s:%s]:\n%s",
+                        start_idx,
+                        end_idx,
+                        verify_llm_positions[:, start_idx:end_idx],
+                    )
+                    logger.warning(
+                        "  - main positions[:, %s:%s]:\n%s",
+                        start_idx,
+                        end_idx,
+                        llm_positions[:, start_idx:end_idx],
+                    )
             else:
                 logger.warning("  - Shapes differ, cannot compare element-wise")
-                logger.warning("  - test() positions:\n%s", verify_llm_positions)
-                logger.warning("  - main positions:\n%s", llm_positions)
+                logger.warning(
+                    "  - test() positions[:, :20]:\n%s",
+                    verify_llm_positions[:, :20],
+                )
+                logger.warning(
+                    "  - main positions[:, :20]:\n%s",
+                    llm_positions[:, :20],
+                )
             logger.warning("=" * 60)
         else:
             logger.debug(
