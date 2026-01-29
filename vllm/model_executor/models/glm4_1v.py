@@ -1580,6 +1580,7 @@ class Glm4vForConditionalGeneration(
     ) -> Iterator[tuple[int, int, int, int]]:
         hf_config = self.config
         spatial_merge_size = hf_config.vision_config.spatial_merge_size
+        video_frame_num = 1
         for mm_feature in sorted(mm_features, key=lambda f: f.mm_position.offset):
             offset = mm_feature.mm_position.offset
             if mm_feature.modality == "image":
@@ -1587,8 +1588,12 @@ class Glm4vForConditionalGeneration(
                 assert t == 1, f"Image must have 1 frame, got {t}"
                 yield offset, t, h // spatial_merge_size, w // spatial_merge_size
             elif mm_feature.modality == "video":
-                t, h, w = mm_feature.data["video_grid_thw"].data.tolist()
-                yield offset, t, h // spatial_merge_size, w // spatial_merge_size
+                _, h, w = mm_feature.data["video_grid_thw"].data.tolist()
+                llm_grid_t = video_frame_num
+                llm_grid_h = h // spatial_merge_size
+                llm_grid_w = w // spatial_merge_size
+                for t_idx in range(llm_grid_t):
+                    yield offset, t_idx, llm_grid_h, llm_grid_w
             else:
                 raise ValueError(f"Unsupported modality: {mm_feature.modality}")
 
