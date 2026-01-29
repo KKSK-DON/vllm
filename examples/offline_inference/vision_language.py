@@ -8,12 +8,15 @@ For most models, the prompt format should follow corresponding examples
 on HuggingFace model repository.
 """
 
+import itertools
+import json
 import os
 import random
 from contextlib import contextmanager
 from dataclasses import asdict
 from typing import NamedTuple
 
+import torch
 from huggingface_hub import snapshot_download
 from transformers import AutoProcessor, AutoTokenizer
 
@@ -23,6 +26,379 @@ from vllm.assets.video import VideoAsset
 from vllm.lora.request import LoRARequest
 from vllm.multimodal.image import convert_image_mode
 from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+# ---------------------------------------------------------------------------
+# GLM-4.1V position comparison: vLLM vs HuggingFace Transformers
+# ---------------------------------------------------------------------------
+
+# List capturing EVERY call to get_mrope_input_positions (including warmup).
+# Each entry is {input_tokens, position_ids, mrope_delta}.
+_vllm_all_captures: list[dict] = []
+
+
+def _install_vllm_capture_hook():
+    """Monkey-patch get_mrope_input_positions to capture input_tokens and
+    position_ids produced inside vLLM.  All invocations (warmup + real
+    inference) are recorded so we can match the right one later."""
+    from vllm.model_executor.models.glm4_1v import Glm4vForConditionalGeneration
+
+    _orig_fn = Glm4vForConditionalGeneration.get_mrope_input_positions
+
+    def _hooked(self, input_tokens, mm_features):
+        result = _orig_fn(self, input_tokens, mm_features)
+        _vllm_all_captures.append(
+            {
+                "input_tokens": list(input_tokens),
+                "position_ids": result[0].clone().cpu(),
+                "mrope_delta": result[1],
+            }
+        )
+        print(
+            f"[capture hook] call #{len(_vllm_all_captures)}, "
+            f"seq_len={len(input_tokens)}"
+        )
+        return result
+
+    Glm4vForConditionalGeneration.get_mrope_input_positions = _hooked
+
+
+def _find_matching_capture(prompt_token_ids: list[int]) -> dict | None:
+    """Find the captured call whose input_tokens matches the real inference
+    prompt_token_ids.  Falls back to the last capture if no exact match."""
+    for cap in reversed(_vllm_all_captures):
+        if cap["input_tokens"] == prompt_token_ids:
+            return cap
+    # No exact match — return the last non-warmup capture (longest sequence)
+    if _vllm_all_captures:
+        return max(_vllm_all_captures, key=lambda c: len(c["input_tokens"]))
+    return None
+
+
+def hf_get_rope_index(
+    input_tokens: list[int],
+    image_grid_thw: torch.LongTensor | None,
+    video_grid_thw: torch.LongTensor | None,
+    spatial_merge_size: int,
+    image_token_id: int,
+    video_start_token_id: int,
+    video_end_token_id: int,
+) -> tuple[torch.Tensor, int]:
+    """Standalone re-implementation of HF Glm4vModel.get_rope_index for a
+    single sequence (no batch dim).  Faithfully mirrors the HF transformers
+    code so we can compare against the vLLM implementation without loading
+    model weights."""
+
+    llm_pos_ids_list: list[torch.Tensor] = []
+
+    if image_grid_thw is not None or video_grid_thw is not None:
+        input_token_type: list[str] = []
+        video_check_flg = False
+        for token in input_tokens:
+            if token == video_start_token_id:
+                video_check_flg = True
+            elif token == video_end_token_id:
+                video_check_flg = False
+
+            if token == image_token_id and not video_check_flg:
+                input_token_type.append("image")
+            elif token == image_token_id and video_check_flg:
+                input_token_type.append("video")
+            else:
+                input_token_type.append("text")
+
+        input_type_group: list[tuple[str, int, int]] = []
+        for key, group in itertools.groupby(
+            enumerate(input_token_type), lambda x: x[1]
+        ):
+            group = list(group)
+            start_index = group[0][0]
+            end_index = group[-1][0] + 1
+            input_type_group.append((key, start_index, end_index))
+
+        image_index, video_index = 0, 0
+        video_group_index = 0
+        video_frame_num = 1
+
+        for modality_type, start_idx, end_idx in input_type_group:
+            st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
+
+            if modality_type == "image":
+                t = image_grid_thw[image_index][0].item()
+                h = image_grid_thw[image_index][1].item()
+                w = image_grid_thw[image_index][2].item()
+                llm_grid_t = t
+                llm_grid_h = h // spatial_merge_size
+                llm_grid_w = w // spatial_merge_size
+
+                t_index = (
+                    torch.arange(llm_grid_t)
+                    .view(-1, 1)
+                    .expand(-1, llm_grid_h * llm_grid_w)
+                    .flatten()
+                )
+                h_index = (
+                    torch.arange(llm_grid_h)
+                    .view(1, -1, 1)
+                    .expand(llm_grid_t, -1, llm_grid_w)
+                    .flatten()
+                )
+                w_index = (
+                    torch.arange(llm_grid_w)
+                    .view(1, 1, -1)
+                    .expand(llm_grid_t, llm_grid_h, -1)
+                    .flatten()
+                )
+                llm_pos_ids_list.append(
+                    torch.stack([t_index, h_index, w_index]) + st_idx
+                )
+                image_index += 1
+                video_frame_num = 1
+
+            elif modality_type == "video":
+                t = video_frame_num
+                h = video_grid_thw[video_index][1].item()
+                w = video_grid_thw[video_index][2].item()
+                llm_grid_t = t
+                llm_grid_h = h // spatial_merge_size
+                llm_grid_w = w // spatial_merge_size
+
+                for t_idx in range(llm_grid_t):
+                    t_index = (
+                        torch.tensor(t_idx)
+                        .view(-1, 1)
+                        .expand(-1, llm_grid_h * llm_grid_w)
+                        .flatten()
+                    )
+                    h_index = (
+                        torch.arange(llm_grid_h)
+                        .view(1, -1, 1)
+                        .expand(1, -1, llm_grid_w)
+                        .flatten()
+                    )
+                    w_index = (
+                        torch.arange(llm_grid_w)
+                        .view(1, 1, -1)
+                        .expand(1, llm_grid_h, -1)
+                        .flatten()
+                    )
+                    llm_pos_ids_list.append(
+                        torch.stack([t_index, h_index, w_index]) + st_idx
+                    )
+
+                video_group_index += 1
+                if video_group_index >= video_grid_thw[video_index][0].item():
+                    video_index += 1
+                    video_group_index = 0
+                video_frame_num += 1
+
+            else:
+                text_len = end_idx - start_idx
+                llm_pos_ids_list.append(
+                    torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx
+                )
+                video_frame_num = 1
+    else:
+        text_len = len(input_tokens)
+        llm_pos_ids_list.append(torch.arange(text_len).view(1, -1).expand(3, -1))
+
+    llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
+    mrope_position_delta = (llm_positions.max() + 1 - len(input_tokens)).item()
+    return llm_positions, mrope_position_delta
+
+
+def _write_debug_file(
+    filepath: str,
+    label: str,
+    input_ids: list[int],
+    position_ids: torch.Tensor,
+    tokenizer,
+):
+    """Write input_ids and position_ids (full, not truncated) to a file."""
+    torch.set_printoptions(threshold=float("inf"), linewidth=200)
+    with open(filepath, "w") as f:
+        f.write(f"=== {label} ===\n\n")
+        f.write(f"--- input_ids (len={len(input_ids)}) ---\n")
+        f.write(json.dumps(input_ids))
+        f.write("\n\n")
+        f.write("--- input_tokens (decoded, one per line) ---\n")
+        for idx, tid in enumerate(input_ids):
+            token_str = tokenizer.decode([tid])
+            f.write(f"[{idx:5d}] id={tid:6d}  token={repr(token_str)}\n")
+        f.write("\n")
+        f.write(f"--- position_ids (shape={list(position_ids.shape)}) ---\n")
+        f.write(f"temporal: {position_ids[0].tolist()}\n")
+        f.write(f"height:   {position_ids[1].tolist()}\n")
+        f.write(f"width:    {position_ids[2].tolist()}\n")
+    print(f"  Written to {filepath}")
+
+
+def compare_glm4v_positions(
+    model_name: str,
+    prompt: str,
+    video_data,
+    video_metadata,
+    mm_processor_kwargs: dict,
+    vllm_prompt_token_ids: list[int],
+    tokenizer,
+):
+    """Compare vLLM-internal vs HF-transformers input_ids and position_ids."""
+    print("\n" + "=" * 70)
+    print("COMPARING vLLM vs HF Transformers (GLM-4.1V video)")
+    print("=" * 70)
+
+    # ----- vLLM side (already captured via monkey-patch) -----
+    print(
+        f"\n  Total hook captures: {len(_vllm_all_captures)} "
+        f"(includes warmup + real inference)"
+    )
+    cap = _find_matching_capture(vllm_prompt_token_ids)
+    if cap is None:
+        print("WARNING: No vLLM position_ids captured. Did the monkey-patch fire?")
+        return
+    vllm_input_ids = cap["input_tokens"]
+    vllm_pos_ids = cap["position_ids"]
+    vllm_mrope_delta = cap["mrope_delta"]
+    matched = vllm_input_ids == vllm_prompt_token_ids
+    print(f"  Using capture with seq_len={len(vllm_input_ids)}, exact match={matched}")
+
+    # ----- HF side: run processor -----
+    print("\nLoading HF Glm4vProcessor for comparison...")
+    hf_processor = AutoProcessor.from_pretrained(model_name)
+
+    # Build the same prompt text used by run_glm4_1v
+    hf_text = prompt
+
+    # The HF processor expects videos as list of video arrays
+    hf_videos = [video_data]
+
+    # Pass the same processing kwargs
+    hf_kwargs = {}
+    if "size" in mm_processor_kwargs:
+        hf_kwargs["size"] = mm_processor_kwargs["size"]
+    if "fps" in mm_processor_kwargs:
+        hf_kwargs["fps"] = mm_processor_kwargs["fps"]
+
+    hf_outputs = hf_processor(
+        text=[hf_text],
+        videos=hf_videos,
+        return_tensors="pt",
+        return_metadata=True,
+        **hf_kwargs,
+    )
+
+    hf_input_ids = hf_outputs["input_ids"][0].tolist()
+    hf_image_grid_thw = hf_outputs.get("image_grid_thw")
+    hf_video_grid_thw = hf_outputs.get("video_grid_thw")
+
+    # Get config values from the processor / model config
+    hf_config = hf_processor.image_processor
+    spatial_merge_size = hf_config.merge_size
+    image_token_id = hf_processor.image_token_id
+    # Get video boundary token IDs from tokenizer
+    video_start_token_id = hf_processor.tokenizer.convert_tokens_to_ids(
+        "<|begin_of_video|>"
+    )
+    video_end_token_id = hf_processor.tokenizer.convert_tokens_to_ids(
+        "<|end_of_video|>"
+    )
+
+    print(f"  HF input_ids length: {len(hf_input_ids)}")
+    print(f"  HF image_grid_thw: {hf_image_grid_thw}")
+    print(f"  HF video_grid_thw: {hf_video_grid_thw}")
+    print(f"  spatial_merge_size: {spatial_merge_size}")
+    print(f"  image_token_id: {image_token_id}")
+    print(f"  video_start_token_id: {video_start_token_id}")
+    print(f"  video_end_token_id: {video_end_token_id}")
+
+    # Compute HF position_ids
+    hf_pos_ids, hf_delta = hf_get_rope_index(
+        input_tokens=hf_input_ids,
+        image_grid_thw=hf_image_grid_thw,
+        video_grid_thw=hf_video_grid_thw,
+        spatial_merge_size=spatial_merge_size,
+        image_token_id=image_token_id,
+        video_start_token_id=video_start_token_id,
+        video_end_token_id=video_end_token_id,
+    )
+
+    # ----- Write full results to files -----
+    hf_tokenizer = hf_processor.tokenizer
+    out_dir = os.path.dirname(os.path.abspath(__file__))
+    vllm_file = os.path.join(out_dir, "vllm_debug_output.txt")
+    hf_file = os.path.join(out_dir, "hf_debug_output.txt")
+
+    print("\nWriting full debug output...")
+    _write_debug_file(vllm_file, "vLLM", vllm_input_ids, vllm_pos_ids, hf_tokenizer)
+    _write_debug_file(
+        hf_file, "HF Transformers", hf_input_ids, hf_pos_ids, hf_tokenizer
+    )
+
+    # ----- Compare input_ids -----
+    print("\n" + "-" * 60)
+    print("INPUT_IDS COMPARISON")
+    print("-" * 60)
+    print(f"  vLLM length: {len(vllm_input_ids)}")
+    print(f"  HF   length: {len(hf_input_ids)}")
+
+    max_len = max(len(vllm_input_ids), len(hf_input_ids))
+    diff_count = 0
+    for i in range(max_len):
+        v_id = vllm_input_ids[i] if i < len(vllm_input_ids) else None
+        h_id = hf_input_ids[i] if i < len(hf_input_ids) else None
+        if v_id != h_id:
+            v_tok = (
+                repr(hf_tokenizer.decode([v_id])) if v_id is not None else "<MISSING>"
+            )
+            h_tok = (
+                repr(hf_tokenizer.decode([h_id])) if h_id is not None else "<MISSING>"
+            )
+            print(
+                f"  [{i:5d}] vLLM: id={v_id!s:>8s} {v_tok:>30s}  |  "
+                f"HF: id={h_id!s:>8s} {h_tok}"
+            )
+            diff_count += 1
+    if diff_count == 0:
+        print("  ==> input_ids are IDENTICAL")
+    else:
+        print(f"  ==> {diff_count} positions differ")
+
+    # ----- Compare position_ids -----
+    print("\n" + "-" * 60)
+    print("POSITION_IDS COMPARISON")
+    print("-" * 60)
+    print(f"  vLLM shape: {list(vllm_pos_ids.shape)},  mrope_delta={vllm_mrope_delta}")
+    print(f"  HF   shape: {list(hf_pos_ids.shape)},  mrope_delta={hf_delta}")
+
+    if vllm_pos_ids.shape == hf_pos_ids.shape:
+        diff_mask = (vllm_pos_ids != hf_pos_ids).any(dim=0)
+        num_pos_diffs = diff_mask.sum().item()
+        if num_pos_diffs == 0:
+            print("  ==> position_ids are IDENTICAL")
+        else:
+            print(f"  ==> {num_pos_diffs} columns differ")
+            diff_indices = torch.nonzero(diff_mask, as_tuple=False).flatten()
+            for idx in diff_indices.tolist():
+                v_t, v_h, v_w = vllm_pos_ids[:, idx].tolist()
+                h_t, h_h, h_w = hf_pos_ids[:, idx].tolist()
+                # Show the token at this position (use vllm_input_ids if
+                # available, else hf)
+                tok_id = (
+                    vllm_input_ids[idx]
+                    if idx < len(vllm_input_ids)
+                    else hf_input_ids[idx]
+                )
+                tok_str = repr(hf_tokenizer.decode([tok_id]))
+                print(
+                    f"  [{idx:5d}] token={tok_str:>20s}  "
+                    f"vLLM(t={v_t},h={v_h},w={v_w})  "
+                    f"HF(t={h_t},h={h_h},w={h_w})"
+                )
+    else:
+        print("  ==> Shapes differ, cannot compare element-wise")
+        print(f"      vLLM: {list(vllm_pos_ids.shape)}")
+        print(f"      HF:   {list(hf_pos_ids.shape)}")
+
+    print("=" * 70 + "\n")
 
 
 class ModelRequestData(NamedTuple):
@@ -2225,6 +2601,12 @@ def main(args):
     }
     if args.tensor_parallel_size is not None:
         engine_args["tensor_parallel_size"] = args.tensor_parallel_size
+
+    # Install capture hook for GLM-4.1V position comparison
+    is_glm4_compare = model in ("glm4_1v", "glm4_5v") and modality == "video"
+    if is_glm4_compare:
+        _install_vllm_capture_hook()
+
     llm = LLM(**engine_args)
 
     # Don't want to check the flag multiple times, so just hijack `prompts`.
@@ -2307,6 +2689,23 @@ def main(args):
         generated_text = o.outputs[0].text
         print(generated_text)
         print("-" * 50)
+
+    # --- GLM-4.1V / GLM-4.5V video position comparison ---
+    if is_glm4_compare:
+        vllm_prompt_token_ids = outputs[0].prompt_token_ids
+        # Extract raw video frames for the HF processor
+        # data is [(video_np, metadata)] for models needing metadata
+        raw_video = data[0][0] if isinstance(data[0], tuple) else data
+        raw_metadata = data[0][1] if isinstance(data[0], tuple) else None
+        compare_glm4v_positions(
+            model_name=req_data.engine_args.model,
+            prompt=prompts[0],
+            video_data=raw_video,
+            video_metadata=raw_metadata,
+            mm_processor_kwargs=dict(req_data.engine_args.mm_processor_kwargs or {}),
+            vllm_prompt_token_ids=vllm_prompt_token_ids,
+            tokenizer=llm.get_tokenizer(),
+        )
 
     if args.verify_mm_cache_hit_with_uuids:
         try:
