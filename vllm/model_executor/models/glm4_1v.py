@@ -27,7 +27,9 @@
 """Inference-only GLM-4V model compatible with HuggingFace weights."""
 
 import itertools
+import json
 import math
+import os
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from functools import partial
 from typing import Annotated, Any, Literal, TypeAlias
@@ -115,6 +117,33 @@ logger = init_logger(__name__)
 
 # For profile run
 _MAX_FRAMES_PER_VIDEO = 600
+_MROPE_CAPTURE_PATH_ENV = "VLLM_MROPE_CAPTURE_PATH"
+
+
+def _append_mrope_capture_to_file(
+    input_tokens: list[int],
+    position_ids: torch.Tensor,
+    mrope_delta: int,
+) -> None:
+    path = os.environ.get(_MROPE_CAPTURE_PATH_ENV)
+    if not path:
+        return
+    try:
+        dir_name = os.path.dirname(path)
+        if dir_name:
+            os.makedirs(dir_name, exist_ok=True)
+        record = {
+            "pid": os.getpid(),
+            "seq_len": len(input_tokens),
+            "input_tokens": list(input_tokens),
+            "position_ids": position_ids.detach().cpu().tolist(),
+            "mrope_delta": mrope_delta,
+        }
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+    except Exception:
+        logger.exception("Failed to write mrope capture to %s", path)
+
 
 # === Vision Inputs === #
 
@@ -1820,6 +1849,7 @@ class Glm4vForConditionalGeneration(
                 mrope_position_delta,
             )
 
+        _append_mrope_capture_to_file(input_tokens, llm_positions, mrope_position_delta)
         return llm_positions, mrope_position_delta
 
     def forward(

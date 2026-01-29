@@ -19,6 +19,7 @@ from typing import NamedTuple
 import torch
 from huggingface_hub import snapshot_download
 from transformers import AutoProcessor, AutoTokenizer
+from transformers.video_utils import VideoMetadata
 
 from vllm import LLM, EngineArgs, SamplingParams
 from vllm.assets.image import ImageAsset
@@ -34,12 +35,15 @@ from vllm.utils.argparse_utils import FlexibleArgumentParser
 # List capturing EVERY call to get_mrope_input_positions (including warmup).
 # Each entry is {input_tokens, position_ids, mrope_delta}.
 _vllm_all_captures: list[dict] = []
+_MROPE_CAPTURE_PATH_ENV = "VLLM_MROPE_CAPTURE_PATH"
+_DEFAULT_MROPE_CAPTURE_PATH = "/tmp/vllm_mrope_captures.jsonl"
 
 
 def _install_vllm_capture_hook():
     """Monkey-patch get_mrope_input_positions to capture input_tokens and
     position_ids produced inside vLLM.  All invocations (warmup + real
     inference) are recorded so we can match the right one later."""
+    print("[capture hook] installing get_mrope_input_positions hook")
     from vllm.model_executor.models.glm4_1v import Glm4vForConditionalGeneration
 
     _orig_fn = Glm4vForConditionalGeneration.get_mrope_input_positions
@@ -60,11 +64,36 @@ def _install_vllm_capture_hook():
         return result
 
     Glm4vForConditionalGeneration.get_mrope_input_positions = _hooked
+    print("[capture hook] installed")
+
+
+def _load_vllm_captures_from_file() -> list[dict]:
+    path = os.environ.get(_MROPE_CAPTURE_PATH_ENV, _DEFAULT_MROPE_CAPTURE_PATH)
+    if not os.path.exists(path):
+        return []
+    captures: list[dict] = []
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if "input_tokens" not in record or "position_ids" not in record:
+                continue
+            record["position_ids"] = torch.tensor(record["position_ids"])
+            captures.append(record)
+    return captures
 
 
 def _find_matching_capture(prompt_token_ids: list[int]) -> dict | None:
     """Find the captured call whose input_tokens matches the real inference
     prompt_token_ids.  Falls back to the last capture if no exact match."""
+    if not _vllm_all_captures:
+        _vllm_all_captures.extend(_load_vllm_captures_from_file())
+    print(f"_vllm_all_captures:{_vllm_all_captures}")
     for cap in reversed(_vllm_all_captures):
         if cap["input_tokens"] == prompt_token_ids:
             return cap
@@ -251,6 +280,7 @@ def compare_glm4v_positions(
         f"\n  Total hook captures: {len(_vllm_all_captures)} "
         f"(includes warmup + real inference)"
     )
+    print(vllm_prompt_token_ids)
     cap = _find_matching_capture(vllm_prompt_token_ids)
     if cap is None:
         print("WARNING: No vLLM position_ids captured. Did the monkey-patch fire?")
@@ -270,6 +300,16 @@ def compare_glm4v_positions(
 
     # The HF processor expects videos as list of video arrays
     hf_videos = [video_data]
+    hf_video_metadata = None
+    if video_metadata is not None:
+        try:
+            filtered_metadata = {
+                k: v for k, v in video_metadata.items() if k != "do_sample_frames"
+            }
+            hf_video_metadata = [[VideoMetadata(**filtered_metadata)]]
+            hf_videos = [[video_data]]
+        except Exception as exc:
+            print(f"WARNING: Failed to build VideoMetadata for HF: {exc}")
 
     # Pass the same processing kwargs
     hf_kwargs = {}
@@ -277,18 +317,32 @@ def compare_glm4v_positions(
         hf_kwargs["size"] = mm_processor_kwargs["size"]
     if "fps" in mm_processor_kwargs:
         hf_kwargs["fps"] = mm_processor_kwargs["fps"]
+        if hf_video_metadata is None:
+            hf_kwargs["do_sample_frames"] = False
 
+    use_video_metadata = hf_video_metadata is not None
+    return_tensors = "pt" if not use_video_metadata else None
+    return_metadata = use_video_metadata
     hf_outputs = hf_processor(
         text=[hf_text],
         videos=hf_videos,
-        return_tensors="pt",
-        return_metadata=True,
+        video_metadata=hf_video_metadata,
+        return_tensors=return_tensors,
+        return_metadata=return_metadata,
         **hf_kwargs,
     )
 
-    hf_input_ids = hf_outputs["input_ids"][0].tolist()
+    hf_input_ids = list(hf_outputs["input_ids"][0])
     hf_image_grid_thw = hf_outputs.get("image_grid_thw")
     hf_video_grid_thw = hf_outputs.get("video_grid_thw")
+    if hf_image_grid_thw is not None and not isinstance(
+        hf_image_grid_thw, torch.Tensor
+    ):
+        hf_image_grid_thw = torch.tensor(hf_image_grid_thw)
+    if hf_video_grid_thw is not None and not isinstance(
+        hf_video_grid_thw, torch.Tensor
+    ):
+        hf_video_grid_thw = torch.tensor(hf_video_grid_thw)
 
     # Get config values from the processor / model config
     hf_config = hf_processor.image_processor
@@ -352,10 +406,11 @@ def compare_glm4v_positions(
             h_tok = (
                 repr(hf_tokenizer.decode([h_id])) if h_id is not None else "<MISSING>"
             )
-            print(
-                f"  [{i:5d}] vLLM: id={v_id!s:>8s} {v_tok:>30s}  |  "
-                f"HF: id={h_id!s:>8s} {h_tok}"
-            )
+            if h_id:
+                print(
+                    f"  [{i:5d}] vLLM: id={v_id!s:>8s} {v_tok:>30s}  |  "
+                    f"HF: id={h_id!s:>8s} {h_tok}"
+                )
             diff_count += 1
     if diff_count == 0:
         print("  ==> input_ids are IDENTICAL")
@@ -2605,6 +2660,16 @@ def main(args):
     # Install capture hook for GLM-4.1V position comparison
     is_glm4_compare = model in ("glm4_1v", "glm4_5v") and modality == "video"
     if is_glm4_compare:
+        capture_path = os.environ.get(
+            _MROPE_CAPTURE_PATH_ENV, _DEFAULT_MROPE_CAPTURE_PATH
+        )
+        os.environ[_MROPE_CAPTURE_PATH_ENV] = capture_path
+        try:
+            if os.path.exists(capture_path):
+                os.remove(capture_path)
+        except OSError as exc:
+            print(f"[capture hook] failed to clear capture file: {exc}")
+        print(f"[capture hook] capture file: {capture_path}")
         _install_vllm_capture_hook()
 
     llm = LLM(**engine_args)
