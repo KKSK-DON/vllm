@@ -18,7 +18,8 @@ from typing import NamedTuple
 
 import torch
 from huggingface_hub import snapshot_download
-from transformers import AutoProcessor, AutoTokenizer
+from transformers import AutoModelForImageTextToText, AutoProcessor, AutoTokenizer
+from transformers.utils import is_accelerate_available
 from transformers.video_utils import VideoMetadata
 
 from vllm import LLM, EngineArgs, SamplingParams
@@ -37,6 +38,8 @@ from vllm.utils.argparse_utils import FlexibleArgumentParser
 _vllm_all_captures: list[dict] = []
 _MROPE_CAPTURE_PATH_ENV = "VLLM_MROPE_CAPTURE_PATH"
 _DEFAULT_MROPE_CAPTURE_PATH = "/tmp/vllm_mrope_captures.jsonl"
+_HF_MROPE_CAPTURE_PATH_ENV = "HF_MROPE_CAPTURE_PATH"
+_DEFAULT_HF_MROPE_CAPTURE_PATH = "/tmp/hf_mrope_captures.jsonl"
 
 
 def _install_vllm_capture_hook():
@@ -86,6 +89,38 @@ def _load_vllm_captures_from_file() -> list[dict]:
             record["position_ids"] = torch.tensor(record["position_ids"])
             captures.append(record)
     return captures
+
+
+def _load_hf_captures_from_file() -> list[dict]:
+    path = os.environ.get(_HF_MROPE_CAPTURE_PATH_ENV, _DEFAULT_HF_MROPE_CAPTURE_PATH)
+    if not os.path.exists(path):
+        return []
+    captures: list[dict] = []
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if "input_tokens" not in record or "position_ids" not in record:
+                continue
+            record["position_ids"] = torch.tensor(record["position_ids"])
+            captures.append(record)
+    return captures
+
+
+def _find_matching_capture_from_list(
+    captures: list[dict], prompt_token_ids: list[int]
+) -> dict | None:
+    for cap in reversed(captures):
+        if cap["input_tokens"] == prompt_token_ids:
+            return cap
+    if captures:
+        return max(captures, key=lambda c: len(c["input_tokens"]))
+    return None
 
 
 def _find_matching_capture(prompt_token_ids: list[int]) -> dict | None:
@@ -320,19 +355,15 @@ def compare_glm4v_positions(
         if hf_video_metadata is None:
             hf_kwargs["do_sample_frames"] = False
 
-    use_video_metadata = hf_video_metadata is not None
-    return_tensors = "pt" if not use_video_metadata else None
-    return_metadata = use_video_metadata
     hf_outputs = hf_processor(
         text=[hf_text],
         videos=hf_videos,
         video_metadata=hf_video_metadata,
-        return_tensors=return_tensors,
-        return_metadata=return_metadata,
+        return_tensors="pt",
         **hf_kwargs,
     )
 
-    hf_input_ids = list(hf_outputs["input_ids"][0])
+    hf_input_ids = list(hf_outputs["input_ids"][0].tolist())
     hf_image_grid_thw = hf_outputs.get("image_grid_thw")
     hf_video_grid_thw = hf_outputs.get("video_grid_thw")
     if hf_image_grid_thw is not None and not isinstance(
@@ -364,16 +395,69 @@ def compare_glm4v_positions(
     print(f"  video_start_token_id: {video_start_token_id}")
     print(f"  video_end_token_id: {video_end_token_id}")
 
-    # Compute HF position_ids
-    hf_pos_ids, hf_delta = hf_get_rope_index(
-        input_tokens=hf_input_ids,
-        image_grid_thw=hf_image_grid_thw,
-        video_grid_thw=hf_video_grid_thw,
-        spatial_merge_size=spatial_merge_size,
-        image_token_id=image_token_id,
-        video_start_token_id=video_start_token_id,
-        video_end_token_id=video_end_token_id,
+    # Trigger HF get_rope_index via generate()
+    hf_capture_path = os.environ.get(
+        _HF_MROPE_CAPTURE_PATH_ENV, _DEFAULT_HF_MROPE_CAPTURE_PATH
     )
+    os.environ[_HF_MROPE_CAPTURE_PATH_ENV] = hf_capture_path
+    try:
+        if os.path.exists(hf_capture_path):
+            os.remove(hf_capture_path)
+    except OSError as exc:
+        print(f"WARNING: Failed to clear HF capture file: {exc}")
+    print(f"  HF capture file: {hf_capture_path}")
+
+    print("\nRunning HF generate() to trigger get_rope_index...")
+    hf_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+    hf_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    hf_device_map = "auto" if is_accelerate_available() else None
+    hf_model = AutoModelForImageTextToText.from_pretrained(
+        model_name,
+        torch_dtype=hf_dtype,
+        device_map=hf_device_map,
+    )
+    hf_model.eval()
+    if hf_device_map is None:
+        hf_model = hf_model.to(hf_device)
+
+    if hf_image_grid_thw is not None:
+        hf_outputs["image_grid_thw"] = hf_image_grid_thw
+    if hf_video_grid_thw is not None:
+        hf_outputs["video_grid_thw"] = hf_video_grid_thw
+
+    hf_generate_inputs = hf_outputs
+    if hasattr(hf_generate_inputs, "to"):
+        if hf_device_map is None:
+            hf_generate_inputs = hf_generate_inputs.to(hf_device)
+    elif hf_device_map is None:
+        hf_generate_inputs = {
+            key: value.to(hf_device) if isinstance(value, torch.Tensor) else value
+            for key, value in hf_outputs.items()
+        }
+
+    with torch.no_grad():
+        hf_model.generate(
+            **hf_generate_inputs,
+            max_new_tokens=1,
+            do_sample=False,
+        )
+
+    hf_captures = _load_hf_captures_from_file()
+    hf_cap = _find_matching_capture_from_list(hf_captures, hf_input_ids)
+    if hf_cap is not None:
+        hf_pos_ids = hf_cap["position_ids"]
+        hf_delta = hf_cap.get("mrope_delta")
+    else:
+        print("WARNING: No HF capture found, falling back to hf_get_rope_index().")
+        hf_pos_ids, hf_delta = hf_get_rope_index(
+            input_tokens=hf_input_ids,
+            image_grid_thw=hf_image_grid_thw,
+            video_grid_thw=hf_video_grid_thw,
+            spatial_merge_size=spatial_merge_size,
+            image_token_id=image_token_id,
+            video_start_token_id=video_start_token_id,
+            video_end_token_id=video_end_token_id,
+        )
 
     # ----- Write full results to files -----
     hf_tokenizer = hf_processor.tokenizer
