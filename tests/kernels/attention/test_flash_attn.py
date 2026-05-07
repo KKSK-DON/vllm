@@ -26,7 +26,7 @@ NUM_HEADS = [(4, 4), (8, 2)]
 HEAD_SIZES = [40, 72, 80, 128, 256]
 BLOCK_SIZES = [16]
 DTYPES = [torch.bfloat16]
-QDTYPES = [None, torch.float8_e4m3fn]
+QDTYPES = [None, torch.float8_e4m3fn, torch.int8]
 # one value large enough to test overflow in index calculation.
 # one value small enough to test the schema op check
 NUM_BLOCKS = [32768, 2048]
@@ -92,6 +92,71 @@ def ref_paged_attn(
     return torch.cat(outputs, dim=0)
 
 
+def yang_paged_attn(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    query_lens: list[int],
+    kv_lens: list[int],
+    block_tables: torch.Tensor,
+    scale: float,
+    sliding_window: int | None = None,
+    soft_cap: float | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
+) -> torch.Tensor:
+    block_tables = block_tables.cpu()
+    _, block_size, num_kv_heads, head_dim = key_cache.shape
+    outputs: list[torch.Tensor] = []
+    start_idx = 0
+
+    for i in range(len(query_lens)):
+        query_len = query_lens[i]
+        kv_len = kv_lens[i]
+        q = query[start_idx : query_len + start_idx]
+        q = q * scale
+
+        num_kv_blocks = (kv_len + block_size - 1) // block_size
+        block_idxs = block_tables[i, :num_kv_blocks]
+        k = key_cache[block_idxs].view(-1, num_kv_heads, head_dim)
+        k = k[:kv_len]
+        if k_scale is not None:
+            k = k.to(q.dtype) * k_scale.reshape(1, num_kv_heads, head_dim)
+        v = value_cache[block_idxs].view(-1, num_kv_heads, head_dim)
+        v = v[:kv_len]
+        if v_scale is not None:
+            v = v.to(q.dtype) * v_scale.reshape(1, num_kv_heads, head_dim)
+
+        if q.shape[1] != k.shape[1]:  # gqa
+            k = torch.repeat_interleave(k, q.shape[1] // k.shape[1], dim=1)
+            v = torch.repeat_interleave(v, q.shape[1] // v.shape[1], dim=1)
+
+        attn_score = torch.einsum("qnd,knd->nqk", q, k).float()
+        empty_mask = torch.ones(query_len, kv_len)
+        mask = torch.triu(empty_mask, kv_len - query_len + 1).bool()
+        ########
+        if sliding_window is not None:
+            sliding_window_mask = (
+                torch.triu(
+                    empty_mask, diagonal=kv_len - (query_len + sliding_window) + 1
+                )
+                .bool()
+                .logical_not()
+            )
+            mask |= sliding_window_mask
+        if soft_cap is not None:
+            attn_score = soft_cap * torch.tanh(attn_score / soft_cap)
+        ########
+        attn_score.masked_fill_(mask, float("-inf"))
+        attn = torch.softmax(attn_score, dim=-1).to(v.dtype)
+        out = torch.einsum("nqk,knd->qnd", attn, v)
+
+        outputs.append(out)
+        start_idx += query_len
+
+    return torch.cat(outputs, dim=0)
+
+
 @pytest.mark.parametrize("use_out", [True, False])
 @pytest.mark.parametrize(
     "seq_lens", [[(1, 1328), (5, 18), (129, 463)], [(1, 523), (1, 37), (1, 2011)]]
@@ -120,16 +185,17 @@ def test_varlen_with_paged_kv(
     q_dtype: torch.dtype | None,
 ) -> None:
     torch.set_default_device("cuda")
-    if not is_fa_version_supported(fa_version):
-        pytest.skip(
-            f"Flash attention version {fa_version} not supported due "
-            f'to: "{fa_version_unsupported_reason(fa_version)}"'
-        )
-    if q_dtype is not None and (dtype != torch.bfloat16 or fa_version == 2):
-        pytest.skip(
-            "Flash attention with quantized inputs is only "
-            "supported on version 3 with bfloat16 base type"
-        )
+    if q_dtype != torch.int8:
+        if not is_fa_version_supported(fa_version):
+            pytest.skip(
+                f"Flash attention version {fa_version} not supported due "
+                f'to: "{fa_version_unsupported_reason(fa_version)}"'
+            )
+        if q_dtype is not None and (dtype != torch.bfloat16 or fa_version == 2):
+            pytest.skip(
+                "Flash attention with quantized inputs is only "
+                "supported on version 3 with bfloat16 base type"
+            )
     set_random_seed(0)
     num_seqs = len(seq_lens)
     query_lens = [x[0] for x in seq_lens]
@@ -165,7 +231,14 @@ def test_varlen_with_paged_kv(
     q_descale = None
     k_descale = None
     v_descale = None
-    if q_dtype is not None:
+
+    def quant(x: torch.Tensor, dim_x: int, dim_y: int):
+        x_descale = x.abs().float().amax(dim=(dim_x, dim_y)).clamp(min=1e-6) / 127
+        x_int8 = torch.clamp(torch.round(x / x_descale), -128, 127).to(torch.int8)
+        x_descale = x_descale.to(x.dtype)
+        return x_descale, x_int8
+
+    if q_dtype is not None and q_dtype != torch.int8:
         # QKV are drawn from N(0, 1): no need for a fp8 scaling factor
         maybe_quantized_query = query.to(q_dtype)
         maybe_quantized_key_cache = key_cache.to(q_dtype)
@@ -175,27 +248,36 @@ def test_varlen_with_paged_kv(
         q_descale = torch.ones(scale_shape, dtype=torch.float32)
         k_descale = torch.ones(scale_shape, dtype=torch.float32)
         v_descale = torch.ones(scale_shape, dtype=torch.float32)
+    elif q_dtype == torch.int8:
+        # q_descale, maybe_quantized_query = quant(query)
+        k_descale, maybe_quantized_key_cache = quant(key_cache, 0, 1)
+        v_descale, maybe_quantized_value_cache = quant(value_cache, 0, 1)
 
-    output = flash_attn_varlen_func(
-        q=maybe_quantized_query,
-        k=maybe_quantized_key_cache,
-        v=maybe_quantized_value_cache,
-        out=out,
-        cu_seqlens_q=cu_query_lens,
-        seqused_k=kv_lens,
-        max_seqlen_q=max_query_len,
-        max_seqlen_k=max_kv_len,
-        softmax_scale=scale,
-        causal=True,
-        window_size=window_size,
-        block_table=block_tables,
-        softcap=soft_cap if soft_cap is not None else 0,
-        fa_version=fa_version,
-        q_descale=q_descale,
-        k_descale=k_descale,
-        v_descale=v_descale,
-    )
-    output = output if not use_out else out
+    if q_dtype != torch.int8:
+        output = flash_attn_varlen_func(
+            q=maybe_quantized_query,
+            k=maybe_quantized_key_cache,
+            v=maybe_quantized_value_cache,
+            out=out,
+            cu_seqlens_q=cu_query_lens,
+            seqused_k=kv_lens,
+            max_seqlen_q=max_query_len,
+            max_seqlen_k=max_kv_len,
+            softmax_scale=scale,
+            causal=True,
+            window_size=window_size,
+            block_table=block_tables,
+            softcap=soft_cap if soft_cap is not None else 0,
+            fa_version=fa_version,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+        )
+        output = output if not use_out else out
+
+    yang_q = maybe_quantized_query.clone()
+    yang_k = maybe_quantized_key_cache.clone()
+    yang_v = maybe_quantized_value_cache.clone()
 
     ref_output = ref_paged_attn(
         query=query,
@@ -208,10 +290,35 @@ def test_varlen_with_paged_kv(
         sliding_window=sliding_window,
         soft_cap=soft_cap,
     )
-    atol, rtol = 1.5e-2, 1e-2
-    if q_dtype is not None:
+
+    yang_out = yang_paged_attn(
+        query=yang_q,
+        key_cache=yang_k,
+        value_cache=yang_v,
+        query_lens=query_lens,
+        kv_lens=kv_lens,
+        block_tables=block_tables,
+        scale=scale,
+        sliding_window=sliding_window,
+        soft_cap=soft_cap,
+        k_scale=k_descale,
+        v_scale=v_descale,
+    )
+
+    if q_dtype != torch.int8:
+        atol, rtol = 1.5e-2, 1e-2
+        if q_dtype is not None:
+            atol, rtol = 1.5e-1, 1.5e-1
+        (
+            torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol),
+            f"{torch.max(torch.abs(output - ref_output))}",
+        )
+    if q_dtype == torch.int8:
         atol, rtol = 1.5e-1, 1.5e-1
-    (
-        torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol),
-        f"{torch.max(torch.abs(output - ref_output))}",
+    torch.testing.assert_close(
+        ref_output,
+        yang_out,
+        atol=atol,
+        rtol=rtol,
+        msg=f"{torch.max(torch.abs(ref_output - yang_out))}",
     )
