@@ -13,9 +13,9 @@ logger = init_logger(__name__)
 _logged_mode: str | None = None
 
 
-def quant(
+def compute_kv_scale(
     x: torch.Tensor, dims: tuple, kv_lens: list[int], block_tables: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     num_blks, blk_size, num_kv_heads, head_dim = x.shape
     xs = []
     for i in range(len(kv_lens)):
@@ -27,9 +27,9 @@ def quant(
     real_x = torch.cat(xs, dim=0)
 
     x_descale = real_x.abs().float().amax(dim=dims, keepdim=True).clamp(min=1e-6) / 127
-    x_int8 = torch.clamp(torch.round(x / x_descale), -128, 127).to(torch.int8)
+    # x_int8 = torch.clamp(torch.round(x / x_descale), -128, 127).to(torch.int8)
     x_descale = x_descale.to(x.dtype)
-    return x_descale, x_int8
+    return x_descale
 
 
 def basic_quant(x: torch.Tensor, dims: tuple) -> tuple[torch.Tensor, torch.Tensor]:
@@ -148,10 +148,16 @@ def yang_paged_attn_int8_accelerate(
 
         num_kv_blocks = (kv_len + block_size - 1) // block_size
         block_idxs = block_tables[i, :num_kv_blocks]
-        k_int8 = key_cache[block_idxs].view(-1, num_kv_heads, head_dim)
-        k_int8 = k_int8[:kv_len]
-        v_int8 = value_cache[block_idxs].view(-1, num_kv_heads, head_dim)
-        v_int8 = v_int8[:kv_len]
+        k = key_cache[block_idxs].view(-1, num_kv_heads, head_dim)
+        k = k[:kv_len]
+        k_int8 = torch.clamp(torch.round(k.float() / k_scale.float()), -128, 127).to(
+            torch.int8
+        )
+        v = value_cache[block_idxs].view(-1, num_kv_heads, head_dim)
+        v = v[:kv_len]
+        v_int8 = torch.clamp(torch.round(v.float() / v_scale.float()), -128, 127).to(
+            torch.int8
+        )
         # per channel 1, 1, num_kv_heads, head_dim
         # per head 1, 1, num_kv_heads, 1
         if q.shape[1] != k_int8.shape[1]:  # gqa
@@ -286,13 +292,13 @@ def yang_forward(
                 pool_max,
                 used_max,
             )
-        k_scale, k_int8 = quant(key_cache, dims, kv_len, block_tables)
-        v_scale, v_int8 = quant(value_cache, dims, kv_len, block_tables)
+        k_scale = compute_kv_scale(key_cache, dims, kv_len, block_tables)
+        v_scale = compute_kv_scale(value_cache, dims, kv_len, block_tables)
 
         out = yang_paged_attn_int8_accelerate(
             query=query,
-            key_cache=k_int8,
-            value_cache=v_int8,
+            key_cache=key_cache,
+            value_cache=value_cache,
             query_lens=query_lens,
             kv_lens=kv_len,
             block_tables=block_tables,
