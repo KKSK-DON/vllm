@@ -4,6 +4,7 @@
 
 import copy
 import functools
+import os
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -1038,6 +1039,22 @@ class FlashAttentionImpl(AttentionImpl):
                 )
                 return output
             else:
+                yang_mode = os.environ.get("YANG_ATTN_MODE", "")
+                if yang_mode:
+                    from vllm.v1.attention.backends.yang_attn import (
+                        yang_forward,
+                    )
+
+                    return yang_forward(
+                        yang_mode,
+                        self,
+                        query,
+                        key_cache,
+                        value_cache,
+                        output,
+                        num_actual_tokens,
+                        attn_metadata,
+                    )
                 causal = attn_metadata.causal
                 is_dynamic_causal = isinstance(causal, torch.Tensor)
 
