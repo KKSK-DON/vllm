@@ -26,8 +26,15 @@ def load_calib_questions() -> list[str]:
     import yaml
 
     task_dir = os.path.join(os.path.dirname(lm_eval.tasks.__file__), "aime")
+
+    class _Loader(yaml.SafeLoader):
+        pass
+
+    # lm-eval task yamls use a custom "!function" tag; we only need the
+    # dataset fields, so parse that tag as None instead of erroring.
+    _Loader.add_constructor("!function", lambda loader, node: None)
     with open(os.path.join(task_dir, "aime25.yaml")) as f:
-        cfg = yaml.safe_load(f)
+        cfg = yaml.load(f, Loader=_Loader)
 
     from datasets import load_dataset
 
