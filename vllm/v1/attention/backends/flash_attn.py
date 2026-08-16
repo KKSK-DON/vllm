@@ -85,6 +85,10 @@ class FlashAttentionBackend(AttentionBackend):
         "bfloat16",
         "fp8",
         "fp8_e4m3",
+        # Plain int8 storage: pool holds int8 codes quantized with external
+        # static scales (per-channel or per-head, per YANG_ATTN_MODE);
+        # write/read handled by yang_attn, never by the native kernels.
+        "int8",
     ]
 
     @staticmethod
@@ -823,6 +827,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
 
 class FlashAttentionImpl(AttentionImpl):
     can_return_lse_for_decode: bool = True
+    _calib_amax: ClassVar[dict[str, dict[str, torch.Tensor]]] = {}
 
     def __init__(
         self,
@@ -1048,6 +1053,7 @@ class FlashAttentionImpl(AttentionImpl):
                     return yang_forward(
                         yang_mode,
                         self,
+                        layer,
                         query,
                         key_cache,
                         value_cache,
@@ -1194,6 +1200,45 @@ class FlashAttentionImpl(AttentionImpl):
         )
         return output
 
+    def _calibrate_observe(
+        self,
+        layer_name: str,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        path = os.environ.get("YANG_KV_SCALE_PATH")
+        assert path, "calibrate mode requires YANG_KV_SCALE_PATH"
+        entry = self._calib_amax.setdefault(layer_name, {})
+        changed = False
+        for table_name, cache in (("k_amax", key), ("v_amax", value)):
+            real = cache[: slot_mapping.shape[0]]
+            new = real.abs().float().amax(dim=(0,), keepdim=True)
+            old = entry.get(table_name)
+            if old is None:
+                entry[table_name] = new
+                changed = True
+            else:
+                merged = torch.maximum(old, new)
+                if not torch.equal(merged, old):
+                    entry[table_name] = merged
+                    changed = True
+        if changed:
+            snapshot = {}
+            for layer, tables in self._calib_amax.items():
+                saved = {table_name: t.cpu() for table_name, t in tables.items()}
+                # everything derivable is derived here, offline: per_head tables
+                # and ready-to-use scales, so eval runs purely read the file
+                saved["k_amax_per_head"] = saved["k_amax"].amax(dim=-1, keepdim=True)
+                saved["v_amax_per_head"] = saved["v_amax"].amax(dim=-1, keepdim=True)
+                for amax_name in list(saved):
+                    scale_name = amax_name.replace("amax", "scale")
+                    saved[scale_name] = saved[amax_name].clamp(min=1e-6) / 127
+                snapshot[layer] = saved
+            tmp = path + ".tmp"
+            torch.save(snapshot, tmp)
+            os.replace(tmp, path)
+
     def do_kv_cache_update(
         self,
         layer: torch.nn.Module,
@@ -1207,11 +1252,23 @@ class FlashAttentionImpl(AttentionImpl):
             # we use direct Q, K, V tensors without caching
             return
 
+        yang_mode = os.environ.get("YANG_ATTN_MODE", "")
+        if yang_mode.startswith("int8_phys"):
+            from vllm.v1.attention.backends.yang_attn import yang_static_write
+
+            yang_static_write(layer, key, value, kv_cache, slot_mapping)
+            return
+        if self.kv_cache_dtype == "int8":
+            raise NotImplementedError(
+                "kv_cache_dtype=int8 has no native write kernel; run with "
+                "YANG_ATTN_MODE=int8_phys_per_channel or int8_phys_per_head"
+            )
         # Scatter write into the KV cache using slot_mapping indices.
         # No TMA kernel is invoked here, so stride canonicalization is not needed.
         # (B, H, N, 2*D) -> ((B, N, H, D), (B, N, H, D))
         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
-
+        if yang_mode == "calibrate":
+            self._calibrate_observe(layer.layer_name, key, value, slot_mapping)
         # Reshape the input keys and values and store them in the cache.
         # Skip this if sharing KV cache with an earlier attention layer.
         # NOTE(woosuk): Here, key and value are padded while slot_mapping is

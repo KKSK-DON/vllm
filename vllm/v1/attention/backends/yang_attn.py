@@ -12,6 +12,125 @@ logger = init_logger(__name__)
 
 _logged_mode: str | None = None
 
+# _calib_amax: dict[str, dict[str, torch.Tensor]] = {}
+_static_scale_cache: dict[tuple[str, str], tuple[torch.Tensor, torch.Tensor]] = {}
+_static_scales: dict | None = None
+
+
+# def _gather_valid_tokens(
+#     x: torch.Tensor, kv_lens: list[int], block_tables: torch.Tensor
+# ) -> torch.Tensor:
+#     _, blk_size, num_kv_heads, head_dim = x.shape
+#     xs = []
+#     for i in range(len(kv_lens)):
+#         kv_len = kv_lens[i]
+#         num_kv_blocks = (kv_len + blk_size - 1) // blk_size
+#         blk_idxs = block_tables[i, :num_kv_blocks]
+#         xs.append(x[blk_idxs].view(-1, num_kv_heads, head_dim)[:kv_len])
+#     return torch.cat(xs, dim=0)
+
+
+# def _calibrate_observe(#
+#     layer_name: str,
+#     key_cache: torch.Tensor,
+#     value_cache: torch.Tensor,
+#     kv_lens: list[int],
+#     block_tables: torch.Tensor,
+# ) -> None:
+#     path = os.environ.get("YANG_KV_SCALE_PATH")
+#     assert path, "calibrate mode requires YANG_KV_SCALE_PATH"
+#     entry = _calib_amax.setdefault(layer_name, {})
+#     changed = False
+#     for table_name, cache in (("k_amax", key_cache), ("v_amax", value_cache)):
+#         real = _gather_valid_tokens(cache, kv_lens, block_tables)
+#         new = real.abs().float().amax(dim=(0,), keepdim=True)
+#         old = entry.get(table_name)
+#         if old is None:
+#             entry[table_name] = new
+#             changed = True
+#         else:
+#             merged = torch.maximum(old, new)
+#             if not torch.equal(merged, old):
+#                 entry[table_name] = merged
+#                 changed = True
+#     if changed:
+#         snapshot = {}
+#         for layer, tables in _calib_amax.items():
+#             saved = {table_name: t.cpu() for table_name, t in tables.items()}
+#             # everything derivable is derived here, offline: per_head tables
+#             # and ready-to-use scales, so eval runs purely read the file
+#             saved["k_amax_per_head"] = saved["k_amax"].amax(dim=-1, keepdim=True)
+#             saved["v_amax_per_head"] = saved["v_amax"].amax(dim=-1, keepdim=True)
+#             for amax_name in list(saved):
+#                 scale_name = amax_name.replace("amax", "scale")
+#                 saved[scale_name] = saved[amax_name].clamp(min=1e-6) / 127
+#             snapshot[layer] = saved
+#         tmp = path + ".tmp"
+#         torch.save(snapshot, tmp)
+#         os.replace(tmp, path)
+
+
+def _get_static_scales(  #
+    layer_name: str, yang_mode: str, device, dtype
+) -> tuple[torch.Tensor, torch.Tensor]:
+    global _static_scales
+    cached = _static_scale_cache.get((layer_name, yang_mode))
+    if cached is not None:
+        return cached
+    if _static_scales is None:
+        path = os.environ.get("YANG_KV_SCALE_PATH")
+        assert path and os.path.exists(path), (
+            "int8_static modes require YANG_KV_SCALE_PATH "
+            "pointing at a calibration file"
+        )
+        _static_scales = torch.load(path, map_location="cpu")
+        logger.info(
+            "[yang_attn] loaded static kv scales for %d layers from %s",
+            len(_static_scales),
+            path,
+        )
+    tables = _static_scales[layer_name]
+    if yang_mode.endswith("per_head"):
+        k_scale = tables["k_scale_per_head"]
+        v_scale = tables["v_scale_per_head"]
+    else:
+        k_scale = tables["k_scale"]
+        v_scale = tables["v_scale"]
+    k_scale = k_scale.to(device=device, dtype=dtype)
+    v_scale = v_scale.to(device=device, dtype=dtype)
+    _static_scale_cache[(layer_name, yang_mode)] = (k_scale, v_scale)
+    return k_scale, v_scale
+
+
+def yang_static_write(
+    layer,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+) -> None:
+    """Physical-int8 write path, replacing reshape_and_cache_flash.
+
+    With kv_cache_dtype=int8 the pool is allocated as torch.int8, so this
+    just quantizes the new K/V tokens with the calibrated static scales
+    and scatters the codes in.
+    """
+    assert kv_cache.dtype == torch.int8
+    mode = os.environ["YANG_ATTN_MODE"]
+    head_size = key.shape[-1]
+    k_scale, v_scale = _get_static_scales(layer.layer_name, mode, key.device, key.dtype)
+    num_tokens = slot_mapping.shape[0]
+    k = key[:num_tokens].float()
+    v = value[:num_tokens].float()
+    k_codes = torch.clamp(torch.round(k / k_scale), -128, 127).to(torch.int8)
+    v_codes = torch.clamp(torch.round(v / v_scale), -128, 127).to(torch.int8)
+    key_cache, value_cache = kv_cache.transpose(1, 2).split(head_size, dim=-1)
+    block_size = key_cache.shape[1]
+    block_idx = slot_mapping // block_size
+    block_off = slot_mapping % block_size
+    key_cache[block_idx, block_off] = k_codes
+    value_cache[block_idx, block_off] = v_codes
+
 
 def compute_kv_scale(
     x: torch.Tensor, dims: tuple, kv_lens: list[int], block_tables: torch.Tensor
@@ -123,6 +242,7 @@ def yang_paged_attn_int8_accelerate(
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
     kvquant_type: int | None = None,
+    pre_quantized: bool = False,
 ) -> torch.Tensor:
     block_tables = block_tables.cpu()
     _, block_size, num_kv_heads, head_dim = key_cache.shape
@@ -150,14 +270,18 @@ def yang_paged_attn_int8_accelerate(
         block_idxs = block_tables[i, :num_kv_blocks]
         k = key_cache[block_idxs].view(-1, num_kv_heads, head_dim)
         k = k[:kv_len]
-        k_int8 = torch.clamp(torch.round(k.float() / k_scale.float()), -128, 127).to(
-            torch.int8
-        )
         v = value_cache[block_idxs].view(-1, num_kv_heads, head_dim)
         v = v[:kv_len]
-        v_int8 = torch.clamp(torch.round(v.float() / v_scale.float()), -128, 127).to(
-            torch.int8
-        )
+        if pre_quantized:
+            # cache already holds int8 codes (physical static mode)
+            k_int8, v_int8 = k, v
+        else:
+            k_int8 = torch.clamp(
+                torch.round(k.float() / k_scale.float()), -128, 127
+            ).to(torch.int8)
+            v_int8 = torch.clamp(
+                torch.round(v.float() / v_scale.float()), -128, 127
+            ).to(torch.int8)
         # per channel 1, 1, num_kv_heads, head_dim
         # per head 1, 1, num_kv_heads, 1
         if q.shape[1] != k_int8.shape[1]:  # gqa
@@ -235,8 +359,11 @@ def yang_paged_attn_int8_accelerate(
 
 
 def yang_forward(
-    yang_mode: str,  # bf16, int8_per_channel, int8_per_head
+    yang_mode: str,  # bf16 / int8_per_channel / int8_per_head
+    #              / calibrate / int8_static_per_channel / int8_static_per_head
+    #              / int8_phys_per_channel / int8_phys_per_head
     self,
+    layer,
     query: torch.Tensor,  # [num_tokens, num_heads, head_size]
     key_cache: torch.Tensor,  # [num_blocks, block_size, num_kv_heads, head_size]
     value_cache: torch.Tensor,
@@ -254,7 +381,12 @@ def yang_forward(
     assert attn_metadata.causal is True
     assert attn_metadata.sliding_window in (None, (-1, -1))
     assert self.sliding_window == (-1, -1)
-    assert self.kv_cache_dtype == "auto"
+    if yang_mode.startswith("int8_phys"):
+        assert self.kv_cache_dtype == "int8", (
+            "int8_phys modes need the int8 pool: launch with kv_cache_dtype=int8"
+        )
+    else:
+        assert self.kv_cache_dtype == "auto"
     assert attn_metadata.mm_prefix_range_tensor is None
     assert attn_metadata.rswa_prefix_lens is None
 
@@ -264,7 +396,11 @@ def yang_forward(
     assert sum(query_lens) == num_actual_tokens
     block_tables = attn_metadata.block_table
 
-    if yang_mode == "bf16":
+    if yang_mode in ("bf16", "calibrate"):
+        # if yang_mode == "calibrate":
+        #     _calibrate_observe(
+        #         layer.layer_name, key_cache, value_cache, kv_len, block_tables
+        #     )
         out = yang_paged_attn(
             query=query,
             key_cache=key_cache,
@@ -274,6 +410,43 @@ def yang_forward(
             block_tables=block_tables,
             scale=self.scale,
             soft_cap=self.logits_soft_cap if self.logits_soft_cap else None,
+        )
+    elif yang_mode in ("int8_phys_per_channel", "int8_phys_per_head"):
+        # with kv_cache_dtype=int8 the carved views arrive as torch.int8
+        assert key_cache.dtype == torch.int8
+        k_scale, v_scale = _get_static_scales(
+            layer.layer_name, yang_mode, query.device, query.dtype
+        )
+        out = yang_paged_attn_int8_accelerate(
+            query=query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            query_lens=query_lens,
+            kv_lens=kv_len,
+            block_tables=block_tables,
+            scale=self.scale,
+            soft_cap=self.logits_soft_cap if self.logits_soft_cap else None,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            kvquant_type=0 if yang_mode.endswith("per_channel") else 1,
+            pre_quantized=True,
+        )
+    elif yang_mode in ("int8_static_per_channel", "int8_static_per_head"):
+        k_scale, v_scale = _get_static_scales(
+            layer.layer_name, yang_mode, query.device, key_cache.dtype
+        )
+        out = yang_paged_attn_int8_accelerate(
+            query=query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            query_lens=query_lens,
+            kv_lens=kv_len,
+            block_tables=block_tables,
+            scale=self.scale,
+            soft_cap=self.logits_soft_cap if self.logits_soft_cap else None,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            kvquant_type=0 if yang_mode.endswith("per_channel") else 1,
         )
     elif yang_mode in ("int8_per_channel", "int8_per_head"):
         # kv_cache are [num_blocks, block_size, num_kv_heads, head_dim]
