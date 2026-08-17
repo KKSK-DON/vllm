@@ -1,13 +1,15 @@
 # int8 KV Cache 动态量化项目 · 成果报告
 
-> 2026-08-12 步骤③收官时整理。int8 kvcache 量化项目（按 Doc 执行）。
-> 分支：`KKSK-DON/vllm` `feature/int8-kvcache`；模型：Qwen3.5-9B（混合架构）；机器：单卡 RTX 4090 48G。
+> 2026-08-12 步骤③收官时整理;2026-08-17 步骤④静态/物理收官更新。int8 kvcache 量化项目（按 Doc 执行）。
+> 分支：`KKSK-DON/vllm` `feature/int8-kvcache`；模型：Qwen3.5-9B（混合架构）；机器：RTX 4090 48G（步骤③）/ RTX PRO 6000 Blackwell 96G（aime 战役与步骤④）。
 
 ---
 
 ## 一、一句话总结
 
 在 vLLM 中以纯 PyTorch 实现了 decode 阶段 paged attention 的 **int8 KV cache 动态量化**（per_channel / per_head 两种粒度），端到端跑通真实模型评测：**humaneval + gsm8k 全量三组对照，精度损失全部小于一个标准误（≤0.15pp），统计意义上无损**。
+
+步骤④续作（2026-08-17）：写入路径校准的**静态 scale** + **物理 int8 存储**（一等公民 `kv_cache_dtype="int8"`）全链路落地——物理与静态 aime25 分数**精确一致**（0.2667/0.3333 双双复现），长上下文同卷耗时 动态 ~60 分钟 → 静态 ~46 → 物理 ~37（原生 12），64k 档位 KV 容量实测 **×1.94**。
 
 背景动机（Doc 设定）：国产芯片无原生 fp8 算力 → 需要 int8 路线；KV cache 是 decode 显存与带宽的大头。
 
@@ -20,7 +22,7 @@
 | (1) kvcache 分布分析、定量化维度 | ✅ | `kvcache_distribution.py`：K 侧 outlier 呈"列状纹理"（固定 channel 跨 token 系统性偏大），per-channel 的 K 侧 MSE 低 3-4 倍 → 选定 per_channel/per_head 两粒度对比 |
 | (2) PyTorch 量化 pageattention + 单测 | ✅ | `tests/kernels/attention/test_flash_attn.py`：`yang_paged_attn`（反量化先行版）+ `yang_paged_attn_int8_accelerate`（int8-first 加速版，含 per_channel 下 k_scale 吸收进 q 的数学等效技巧）。GPU 实测 **640/640 全过** |
 | (3) 模型中动态量化验证精度 | ✅ **本阶段主体** | 详见下文三、四 |
-| (4) 静态量化 | ✅ **完成并实测**（含物理 int8 存储,超出 Doc 要求） | 写入路径校准（aime25 末 5 题量尺,前 15 题考卷零重叠）→ `int8_static_*`（bf16 池+死尺）→ `int8_phys_*`（一等公民 `kv_cache_dtype=int8`,池子物理 int8）。四场 gsm8k 冒烟全部 0.875 与基线逐题持平;**KV 容量实测 1,567,690 → 2,707,828 token（×1.73,并发 191→331）**,同一 58.59 GiB 预算 |
+| (4) 静态量化 | ✅ **完成并实测**（含物理 int8 存储,超出 Doc 要求） | 写入路径校准（aime25 末 5 题量尺,前 15 题考卷零重叠）→ `int8_static_*`（bf16 池+死尺）→ `int8_phys_*`（一等公民 `kv_cache_dtype=int8`,池子物理 int8）。四场 gsm8k 冒烟全部 0.875 与基线逐题持平;**aime25 正赛四场收官:物理与静态分数精确一致,耗时 动态≈60→静态≈46→物理≈37 分钟**;KV 容量实测 8k 档 ×1.73、**64k 档 ×1.94**——终表见「三、aime25 七连测终表」 |
 | (5) 真 kernel 性能优化 | 可外包（文档原文"假装外包"） | 未做；aime 平方成本观察为其必要性提供了实证（见 4.3） |
 
 ### 步骤③的具体工程
@@ -48,14 +50,32 @@
 
 \* aime25 二次战役后补齐：首轮基线 0 分,经逐样本取证发现模型三题全对而判分器全判零——判分正则只认「回复即答案」或 \boxed{} 两种信封,长推理散文两样都没有。加系统提示「final answer within \boxed{}」后判分链路打通。最终三组差异 ±1 题,双向摆动,均在误差棒（±0.13）内。per_head 高于基线属小样本噪声,非量化增益。生成上限 20480 token（实测最长链 ~14k,留 40% 余量）。
 
-### 结论与解读
+### aime25 七连测终表（七种实现同卷对决,2026-08-17 静态/物理收官）
+
+同机（RTX PRO 6000 Blackwell 96G）同卷（aime25 前 15 题,chat template + \boxed 系统提示,`max_gen_toks=20480`,`enforce_eager`）:
+
+| 实现 | 耗时 | exact_match |
+| --- | --- | --- |
+| bf16 原生融合内核 | 11 分 54 秒 | 0.2667 |
+| `int8_per_channel`（动态,每步现场 findmax） | 59 分 36 秒 | 0.2000 |
+| `int8_per_head`（动态） | 56 分 31 秒 | 0.3333 |
+| `int8_static_per_channel`（bf16 池+静态尺） | 47 分 54 秒 | 0.2667 |
+| `int8_static_per_head` | 44 分 47 秒 | 0.3333 |
+| `int8_phys_per_channel`（**池子物理 int8**） | **37 分 47 秒** | 0.2667 |
+| `int8_phys_per_head` | **36 分 47 秒** | 0.3333 |
+
+三条硬结论:
+
+1. **精度**:物理与静态逐格同分（0.2667/0.3333）,与等价性推演一致——同一把 scale 同一次舍入,"写入时量化一次"与"读取时每步量化"的反量化值应逐位相同,贪心解码下轨迹相同、分数必然复现。静态 per-channel 与 bf16 基线同分:校准数据（aime 末 5 题）与考卷（前 15 题）零重叠,长上下文零掉分。
+2. **耗时三层拆解**（看 per-channel 列）:动态→静态 **−11:42** = 免掉每步对收集到的 KV 现场 findmax;静态→物理 **−10:07** = 收集搬运字节减半（int8 池 vs bf16 池）+ 读取侧免量化（码已是 int8,`pre_quantized=True` 直接乘 scale）;物理→原生剩 **~26 分钟** = python 逐步 gather + fp32 einsum 的模拟开销,即步骤⑤融合 kernel 的全部标的。
+3. **4.3 的平方成本观察被定量补全**:当年同根因让 32k 动态场跑 3.5 小时,今天在 ~20k 生成档位表现为动态比静态多付 ~12 分钟——"每步统计"从账单上划掉后,省下的实测价格与理论方向完全一致。
 
 - **所有差异 ≤0.6pp，小于一个标准误（±0.9pp）**——正确表述是"量化版与原版的差异小于随机波动"，不是"掉得少"。
 - **per_channel 没有赢 per_head**：分布分析的 MSE 优势是真的，但 Qwen3.5-9B 的 outlier 病情未重到让 per_head 的 128 档刻度不够用——**量化方案的收益取决于数据分布的病重程度**；拉开差距需换 outlier 更凶的模型或降到 int4。
 - 复现性：克隆实例上全量 gsm8k 基线 0.8787 vs 原机 0.8749（±0.9pp 内）；bf16 冒烟与原生逐题一致。
 - **八连平**（同卷 gsm8k 8 题,变量逐一引入）：原生 / bf16 / 动态 pc / 动态 ph / 静态 pc / 静态 ph / 物理 pc / 物理 ph 全部 0.875——每个新变量（换算子→动态量化→死尺→物理存储）单独证明清白。静态尺以 aime25 末 5 题校准、考 gsm8k 仍持平,跨领域泛化成立。
-- 速度（8 题 gsm8k 生成段）：原生 8s ≈ bf16 版 9s ≈ 动态 int8 版 9s（首版整池量化 59s）≈ 静态版 9s ≈ 物理版 8-11s（输出 81-99 toks/s）——短上下文下六种实现同速;静态/物理的结构性优势（免每步 findmax,线性 vs 平方）在长上下文才显形。
-- **显存容量（c8 实测,物理版 vs auto,同机同 58.59 GiB 预算同 max_model_len=8192）**：KV cache 总容量 1,567,690 → **2,707,828 token（×1.727）**,最大并发 191.37× → **330.55×**。未达理论 2× 的原因是混合架构:8 层全注意力的每 token 字节减半,24 层 GDN 线性注意力的状态页不随 kv_cache_dtype 变,共享池摊平后得 1.73×（由此可反推 GDN 状态摊销占地 ≈ 注意力 bf16 占地的 19%）;纯 Transformer 架构下该比值应逼近 1.94-2.0×。
+- 速度（8 题 gsm8k 生成段）：原生 8s ≈ bf16 版 9s ≈ 动态 int8 版 9s（首版整池量化 59s）≈ 静态版 9s ≈ 物理版 8-11s（输出 81-99 toks/s）——短上下文下六种实现同速;静态/物理的结构性优势（免每步 findmax,线性 vs 平方）在长上下文实测显形:动态 59:36 → 静态 47:54 → 物理 37:47（原生 11:54）,详见「aime25 七连测终表」。
+- **显存容量（c8 实测,物理版 vs auto,同机同 58.59 GiB 预算同 max_model_len=8192）**：KV cache 总容量 1,567,690 → **2,707,828 token（×1.727）**,最大并发 191.37× → **330.55×**。未达理论 2× 的原因是混合架构:8 层全注意力的每 token 字节减半,24 层 GDN 线性注意力的状态页不随 kv_cache_dtype 变,共享池摊平后得 1.73×（由此可反推 GDN 状态摊销占地 ≈ 注意力 bf16 占地的 19%）;纯 Transformer 架构下该比值应逼近 1.94-2.0×。**64k 档位实测印证了这一预测:1,861,632 → 3,610,437 token（×1.939）,并发 28.41x → 55.09x**——GDN 状态按序列数计费（每序列定长,与上下文无关）而注意力 KV 按 token 数计费,上下文档位越长、单序列 token 越多,GDN 占比被摊得越稀,比值就越逼近理论 2×。
 
 ---
 
@@ -113,14 +133,14 @@
 ## 七、遗留与可选项
 
 1. **成果条目提炼**（按 Doc 的收尾流程）——下一个动作。
-2. 静态量化：原理已可讲；代码实现（校准 + 写入钩子 + 读取新模式，纯 PyTorch）可选。
-3. aime 三组对照补齐：带 chat template 重跑，约一晚机器费，可选。
+2. ~~静态量化~~ ✅ 已完成（2026-08-17）：写入路径校准 + 静态尺读取 + 物理 int8 存储全链路实测,见「三、aime25 七连测终表」。
+3. ~~aime 三组对照补齐~~ ✅ 已完成（2026-08-13 动态三组带 chat template + 2026-08-17 静态/物理四组）。
 4. 逐题错误分析：需带 `--log_samples` 重跑（当时未加，逐题输出不存在），需要深挖时再做。
 5. CUDA kernel（④a 写入内核起步）：当练手场，Doc 未作要求。
 
 ## 八、档案索引
 
-- 代码：`feature/int8-kvcache` 分支，commits `491e48c21`、`a728143de`；核心文件 `vllm/v1/attention/backends/yang_attn.py` + `flash_attn.py` 岔路口；单测 `tests/kernels/attention/test_flash_attn.py`。
-- 评测原始日志/JSON：gpuhub 机器数据盘 `/root/autodl-tmp/evals/{A_baseline, B_*, C_*}`（关机保数据）。
+- 代码：`feature/int8-kvcache` 分支，commits `491e48c21`、`a728143de`（步骤③）、`d49dce793`（步骤④静态+物理整包:校准观察员/静态尺读写/一等公民 `kv_cache_dtype=int8`）、`302a755c8`（校准脚本兼容 lm-eval 的 `!function` yaml 标签）；核心文件 `vllm/v1/attention/backends/yang_attn.py` + `flash_attn.py` 岔路口；单测 `tests/kernels/attention/test_flash_attn.py`；校准脚本 `yang_calibrate_kv.py`。
+- 评测原始日志/JSON：gpuhub 机器数据盘 `/root/autodl-tmp/evals/{A_*,B_*,C_*,D_*,E_*,F_*,V_*}` + 汇总 `AIME_FINAL_SUMMARY.txt` + 校准产物 `kv_scales.pt`（关机保数据）；**本地全量镜像 `~/Documents/personal-projects/vllm-eval-archive/`**（离线可查,免开机器）。
 - 技术笔记：`KV_CACHE_QUANTIZATION.md`（附录 E 为本阶段实验详录；D.5 为量化粒度判读方法）。
 - 工作方式备注：代码由本人手写（两轮重写：接线适配器、scale 重构），AI 担任评审（严重度排序错误清单）、运维（远程机器与评测编排）与教学讲解；诊断结论均经探针数据或源码原文验证。
