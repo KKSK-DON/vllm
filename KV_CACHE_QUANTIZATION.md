@@ -1025,3 +1025,59 @@ per_channel 没赢 per_head 怎么和我的分布分析（per-channel K 侧 MSE 
 - commits（fork KKSK-DON/vllm，feature/int8-kvcache）：`491e48c21` 接线+NaN 修复；`a728143de` 提速+fp32 除法。
 - 评测原始日志/JSON：机器数据盘 `/root/autodl-tmp/evals/{B_*,C_*}`（关机保数据；未加 `--log_samples`，无逐题输出——将来想做逐题错误分析需带该参数重跑）。
 - bf16 冒烟（接线证明）：8 题 gsm8k 与原生 flash 逐题一致（0.875=0.875）；gsm8k 全量基线在克隆机上复现 0.8787（原机 0.8749，±0.9pp 内）。
+
+---
+
+# 附录 F: 步骤④静态量化与物理 int8 存储收官（2026-08-17）
+
+机器换为 RTX PRO 6000 Blackwell 96G;按 Doc 步骤④"先 dump 量化参数,再把 dtype 设成 int8"执行。
+
+### F.1 设计:校准观察员 + 静态尺（离线定死的固定 scale）+ 物理 int8
+
+- **校准（写入路径观察员）**:`FlashAttentionImpl._calibrate_observe` 挂在 `do_kv_cache_update` 的原生写入之前,每步只看本批新 token（按 `slot_mapping` 长度切掉填充尾）,per-channel amax 用 `torch.maximum` 与历史逐元素取大合并;账本是类属性 `_calib_amax`（8 个后端实例共享一本,否则各记各的、存档互相覆盖）。落盘时离线派生全部 8 张表:k/v × amax/scale × per_channel/per_head,`os.replace` 原子写。**每个值一生只被观察一次——线性成本,与 E.2.3 的平方灾难构成对照。**
+- **校准数据**:aime25 末 5 题（`yang_calibrate_kv.py`:`llm.chat` + \boxed 系统提示,复刻考试环境;数据集路径直接读 lm-eval 自己的 `aime25.yaml`,保证与考卷同源）;考卷用前 15 题,**零重叠**。产物 `kv_scales.pt`:8 层 × 8 表,k_amax 范围 12.50-18.25,无 NaN/Inf。
+- **`int8_static_*`（静态尺模拟）**:池子仍 bf16,读取侧量化→反量化,但 scale 纯查表（`_get_static_scales` 带记忆缓存),免每步 findmax。
+- **`int8_phys_*`（物理 int8）**:`kv_cache_dtype="int8"` 一等公民接入——`CacheDType` 菜单加项 + FlashAttention 后端支持名单加项,池子由分配器原生按 `torch.int8` 划分;刻意走"非量化车道"（`is_quantized_kv_cache("int8")=False`),fp8 视图重解释/query 量化/FA3 检查全部不触发。写入时 `yang_static_write` 用静态尺把新 token 量化成 int8 码直存池子（`slot_mapping` 整除/取余定位块与块内偏移),读取 `pre_quantized=True` 跳过量化直接乘 scale 反量化。**池子物理减半,容量翻倍是真的。**
+
+### F.2 精度:三级验证全绿
+
+| 验证 | 结果 |
+| --- | --- |
+| gsm8k 8 题冒烟·八连平（八种实现同卷同分） | 原生/bf16/动态pc/动态ph/静态pc/静态ph/物理pc/物理ph 全 0.875 |
+| 跨领域泛化 | aime 校准的尺考 gsm8k 不掉分（上一行即证据） |
+| aime25 正赛 15 题 | 静态 pc/ph = **0.2667/0.3333**;物理 pc/ph = **0.2667/0.3333** |
+
+物理与静态**精确同分**是等价性预言的命中:同一把 scale、同一次舍入,"写入时量化一次存码"与"读取时每步量化"的反量化值逐位相同,贪心解码下轨迹一致、分数必然复现——这不是"差不多",是可证伪预测被证实。静态 pc 与 bf16 基线同分(0.2667),校准与考卷零重叠下长上下文零掉分;pc/ph 之间 ±1 题摆动同动态版,全在误差棒(±0.12)内。
+
+### F.3 性能:长上下文七连测（同机同卷,aime25 前 15 题,`max_gen_toks=20480`）
+
+| 实现 | 耗时 | exact_match |
+| --- | --- | --- |
+| bf16 原生融合内核 | 11:54 | 0.2667 |
+| `int8_per_channel`（动态） | 59:36 | 0.2000 |
+| `int8_per_head`（动态） | 56:31 | 0.3333 |
+| `int8_static_per_channel` | 47:54 | 0.2667 |
+| `int8_static_per_head` | 44:47 | 0.3333 |
+| `int8_phys_per_channel` | **37:47** | 0.2667 |
+| `int8_phys_per_head` | **36:47** | 0.3333 |
+
+耗时三层拆解（per-channel 列）:
+
+- 动态→静态 **−11:42**:免掉每步对收集到的 KV 现场 findmax——静态尺买到的那一刀;
+- 静态→物理 **−10:07**:收集搬运字节减半（int8 池 vs bf16 池）+ 读取侧免量化（码已是 int8）;
+- 物理→原生剩 **~26 分钟**:python 逐步 gather + fp32 einsum 的模拟开销——步骤⑤融合 kernel 的全部标的。再次印证三级台阶:正确性不需要 kernel,kernel 买的只是速度。
+
+### F.4 显存:c8 容量实测（两个上下文档位）
+
+| 档位 | bf16 池 | int8 池 | 比值 | 最大并发 |
+| --- | --- | --- | --- | --- |
+| `max_model_len=8192`（冒烟） | 1,567,690 | 2,707,828 | ×1.727 | 191.37x → 330.55x |
+| `max_model_len=65536`（正赛） | 1,861,632 | 3,610,437 | **×1.939** | 28.41x → 55.09x |
+
+比值随档位变化的机理:GDN 线性注意力的状态**按序列数计费**（每序列定长,与上下文长度无关）,注意力 KV **按 token 数计费**。档位越长、单序列 token 越多,GDN 状态占比被摊得越稀,int8 化的收益占比越大——64k 档 ×1.94 已逼近纯 Transformer 的理论 2×,混合架构的折扣基本消失。
+
+### F.5 代码、评审与存档
+
+- commits（fork `KKSK-DON/vllm`,`feature/int8-kvcache`）:`d49dce793` 静态+物理整包;`302a755c8` 校准脚本兼容 lm-eval 的 `!function` yaml 标签（自定义 `yaml.SafeLoader` 子类把该标签解析为 None）。
+- 对抗评审（Codex 静态审查）:F 类（双重缩放/GQA 重复因子）零发现;已修 scale-dtype 统一（写读两侧同用 bf16 尺,消除记忆缓存键不含 dtype 的中毒隐患）;记录在案不修:cascade 围栏（默认关闭）、负槽位过滤（当前 eager 单卡配置影响面 0）、KV 传输指纹（单机不活跃）。
+- 存档:机器 `/root/autodl-tmp/evals/`（`F_static_*`/`F_phys_*` 四场日志、`AIME_FINAL_SUMMARY.txt` 汇总、`kv_scales.pt`）;**本地全量镜像 `~/Documents/personal-projects/vllm-eval-archive/`**。
