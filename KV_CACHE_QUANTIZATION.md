@@ -996,14 +996,14 @@ for name, layer in model.named_modules():
 
 ### E.1 最终对照总表
 
-模型 Qwen3.5-9B（混合架构，33 层中 9 层全注意力走我的代码），单卡 4090 48G，`enforce_eager=True`，动态量化（每次调用现场 findmax，q per-tensor + KV per-channel/per-head）。
+模型 Qwen3.5-9B（混合架构，32 层中 8 层全注意力走我的代码;层号 3,7,11,15,19,23,27,31,`full_attention_interval=4`。早期笔记误记"33 层/9 层"——当时 grep 把配置键名也数进去了,2026-08-17 核正），单卡 4090 48G，`enforce_eager=True`，动态量化（每次调用现场 findmax，q per-tensor + KV per-channel/per-head）。
 
 | 基准 | 原始 bf16 | int8_per_channel | int8_per_head |
 | --- | --- | --- | --- |
 | humaneval pass@1（164 题，0-shot） | 0.7073 | **0.7134**（+0.6pp） | **0.7073**（±0） |
 | gsm8k strict（1319 题全量，5-shot） | 0.8787 | **0.8772**（−0.15pp） | **0.8779**（−0.08pp） |
 | gsm8k flexible | 0.8741 | 0.8704 | 0.8741 |
-| aime25（30 题，0-shot） | 0（地板效应） | 砍掉* | 砍掉* |
+| aime25（"25" 是年份 = AIME 2025;全集 30 题，0-shot） | 0（地板效应） | 砍掉* | 砍掉* |
 
 \* aime25 基线即 0/30（lm-eval 该任务是裸补全格式不套 chat template，且题目难度远超 9B），基准失去分辨力；加之 int8 场次在 32k 上下文下单场需 3.5h（见 E.2.3），砍掉换 gsm8k 全量补考。
 
@@ -1051,15 +1051,17 @@ per_channel 没赢 per_head 怎么和我的分布分析（per-channel K 侧 MSE 
 
 ### F.3 性能:长上下文七连测（同机同卷,aime25 前 15 题,`max_gen_toks=20480`）
 
-| 实现 | 耗时 | exact_match |
-| --- | --- | --- |
-| bf16 原生融合内核 | 11:54 | 0.2667 |
-| `int8_per_channel`（动态） | 59:36 | 0.2000 |
-| `int8_per_head`（动态） | 56:31 | 0.3333 |
-| `int8_static_per_channel` | 47:54 | 0.2667 |
-| `int8_static_per_head` | 44:47 | 0.3333 |
-| `int8_phys_per_channel` | **37:47** | 0.2667 |
-| `int8_phys_per_head` | **36:47** | 0.3333 |
+| 实现 | 耗时 | 生成吞吐(15 路合计) | 实际生成总 token | exact_match |
+| --- | --- | --- | --- | --- |
+| bf16 原生融合内核 | 11:54 | 465.8 toks/s | ≈277.6k | 0.2667 |
+| `int8_per_channel`（动态） | 59:36 | 79.0 | ≈273.2k | 0.2000 |
+| `int8_per_head`（动态） | 56:31 | 83.4 | ≈273.1k | 0.3333 |
+| `int8_static_per_channel` | 47:54 | 101.1 | ≈278.7k | 0.2667 |
+| `int8_static_per_head` | 44:47 | 103.6 | ≈266.1k | 0.3333 |
+| `int8_phys_per_channel` | **37:47** | **129.5** | ≈278.6k | 0.2667 |
+| `int8_phys_per_head` | **36:47** | **127.2** | ≈266.1k | 0.3333 |
+
+七场同卷同 15 题,实际生成总量 266k-279k（±2.4%）几乎相同——耗时差即每 token 速度差,无"生成短"的水分;物理与静态同粒度总生成量差 <0.01%（pc 278,641 vs 278,659;ph 266,082 vs 266,071）,等价性再证。吞吐为 15 路并发合计（原生单路 ≈31 toks/s）,耗时含 ~2 分钟引擎启动。
 
 耗时三层拆解（per-channel 列）:
 
