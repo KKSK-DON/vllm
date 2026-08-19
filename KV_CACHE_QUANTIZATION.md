@@ -1083,3 +1083,21 @@ per_channel 没赢 per_head 怎么和我的分布分析（per-channel K 侧 MSE 
 - commits（fork `KKSK-DON/vllm`,`feature/int8-kvcache`）:`d49dce793` 静态+物理整包;`302a755c8` 校准脚本兼容 lm-eval 的 `!function` yaml 标签（自定义 `yaml.SafeLoader` 子类把该标签解析为 None）。
 - 对抗评审（Codex 静态审查）:F 类（双重缩放/GQA 重复因子）零发现;已修 scale-dtype 统一（写读两侧同用 bf16 尺,消除记忆缓存键不含 dtype 的中毒隐患）;记录在案不修:cascade 围栏（默认关闭）、负槽位过滤（当前 eager 单卡配置影响面 0）、KV 传输指纹（单机不活跃）。
 - 存档:机器 `/root/autodl-tmp/evals/`（`F_static_*`/`F_phys_*` 四场日志、`AIME_FINAL_SUMMARY.txt` 汇总、`kv_scales.pt`）;**本地全量镜像 `~/Documents/personal-projects/vllm-eval-archive/`**。
+
+### F.6 chunked prefill 实测对拍（2026-08-19）
+
+方法:10k token 提示 + `max_num_batched_tokens=1024` → 预填充被强制切成 ~10 块;贪心生成 64 token,多路配置交叉 diff **纯生成文本**（vLLM 日志走标准输出,与生成文本同流,须先按"引擎谢幕行之后"提取再比,脚本 `chunk_test.sh`/`chunk_prefill_probe.py` 在评测档案中）。
+
+| 对比 | 结果 |
+| --- | --- |
+| yang bf16:切块 vs 不切块 | **逐字节相同（切块不变性）** |
+| yang bf16 vs 原生（都不切块） | 逐字节相同 |
+| yang bf16 vs `int8_static_per_channel`（都切块） | 逐字节相同 |
+| `int8_static_per_channel` vs `int8_phys_per_channel`（都切块,逐块写入） | 逐字节相同 |
+| 原生:切块 vs 不切块 | **差一个词**（"a text"/"a long text",近平局翻转） |
+
+三条结论:① 切块路径数学正确,且 pytorch 实现具有**切块不变性**——每个 query 行的 softmax 对全前缀一次归约,归约顺序与块边界无关;② 五路 bf16 家族里唯一的漂移出自**原生融合内核自身**:分块改变其瓦片式在线 softmax 的累加顺序,合法浮点末位差在近平局 token 处掀翻贪心选择（两个输出都"对"）;③ 静态/物理在切块读、逐块写下零额外扰动。
+
+附带收获:int8 池使注意力页字节减半,vLLM 自动把注意力块从 528 token 加倍到 1056 以维持"注意力页 ≥ GDN 页"的混合架构约束;16k 档容量 1,711,425 → 3,152,626（×1.842）,与 8k ×1.727、64k ×1.939 构成**单调逼近理论 2× 的三点曲线**（GDN 状态按序列计费被长上下文摊稀）。
+
+两个测试工程教训:探针脚本必须带 `if __name__ == "__main__":` 护栏（vLLM 以 spawn 方式起引擎子进程,子进程重新导入主模块,无护栏则重复建引擎当场熔断）;对拍脚本不可直接 diff 重定向文件（日志噪声天然互不相同）。
