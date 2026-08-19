@@ -1100,6 +1100,18 @@ per_channel 没赢 per_head 怎么和我的分布分析（per-channel K 侧 MSE 
 
 附带收获:int8 池使注意力页字节减半,vLLM 自动把注意力块从 528 token 加倍到 1056 以维持"注意力页 ≥ GDN 页"的混合架构约束;16k 档容量 1,711,425 → 3,152,626（×1.842）,与 8k ×1.727、64k ×1.939 构成**单调逼近理论 2× 的三点曲线**（GDN 状态按序列计费被长上下文摊稀）。
 
+**执行形状的直接见证(2026-08-19 补)**:应"切块是否真的走到了本算子"之问,在 `yang_forward` 加了环境变量 `YANG_CHUNK_WITNESS=1` 门控的日志(第一个全注意力层代表打印本步各段的 query 数与总上下文,commit `1424943d0`)。同一条 7617 token 提示,预算 1024 打出 8 行、预算 16384 恰打 1 行:
+
+```text
+chunk witness: query_lens=[1024] kv_lens=[1024]      ← 第1块,query=kv
+chunk witness: query_lens=[1024] kv_lens=[2048]      ← 第2块起为 1<query<kv 中段形状
+   …每步 kv_lens +1024…
+chunk witness: query_lens=[449]  kv_lens=[7617]      ← 尾块
+(预算 16384 对照:仅一行 query_lens=[7617] kv_lens=[7617])
+```
+
+7×1024+449 = 7617,与整吞版单行严丝合缝对账——切块中段形状全部经过本算子,无一 token 绕道;v1 中 prefill 与 decode 共用同一 varlen 调用,由此获得直接观测(而非仅靠调度器预算的算术推理)。原始输出 `W_chunked.log`/`W_oneshot.log` 在评测档案。
+
 两个测试工程教训:探针脚本必须带 `if __name__ == "__main__":` 护栏（vLLM 以 spawn 方式起引擎子进程,子进程重新导入主模块,无护栏则重复建引擎当场熔断）;对拍脚本不可直接 diff 重定向文件（日志噪声天然互不相同）。
 
 ### F.7 prefix caching 实测对拍（2026-08-19）
