@@ -396,6 +396,20 @@ def yang_forward(
     assert sum(query_lens) == num_actual_tokens
     block_tables = attn_metadata.block_table
 
+    # Chunk witness: prove which prefill shapes actually reach this operator.
+    # query_len == kv_len -> whole-prompt prefill; 1 < query_len < kv_len ->
+    # a chunked-prefill middle piece; query_len == 1 (silent) -> decode.
+    if (
+        os.environ.get("YANG_CHUNK_WITNESS") == "1"
+        and any(qlen > 1 for qlen in query_lens)
+        and layer.layer_name.endswith("layers.3.self_attn.attn")
+    ):
+        logger.info(
+            "[yang_attn] chunk witness: query_lens=%s kv_lens=%s",
+            query_lens[:8],
+            kv_len[:8],
+        )
+
     if yang_mode in ("bf16", "calibrate"):
         # if yang_mode == "calibrate":
         #     _calibrate_observe(
