@@ -910,6 +910,8 @@ for name, layer in model.named_modules():
 | **MLA** | Multi-head Latent Attention，DeepSeek-V2/V3 用 |
 | **FA / FA3** | FlashAttention / FlashAttention 3 |
 | **GQA** | Grouped Query Attention，多个 query head 共享一组 KV head |
+| **码** | 本项目口头语：量化后真正存进 int8 的那个整数，`round(clamp(v/尺, -128, 127))`；真值 ≈ 码 × 尺。"码乘码" = 两个 int8 整数直接相乘（int8 tensor core 的工作模式，尺不参与）|
+| **尺** | 本项目口头语：scale，量化刻度——int8 的每一格代表的真实数值大小；per_channel = 每 (头, 通道) 一把尺，per_head = 每头一把尺 |
 
 ## C. 与你 `feature/int8-kvcache` 分支的对接点
 
