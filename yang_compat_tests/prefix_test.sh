@@ -1,5 +1,5 @@
 #!/bin/bash
-# prefix caching 对拍: 7.5k 公共前缀 + 两问, 开/关 enable_prefix_caching × 三模式。
+# prefix caching 对拍: 7.5k 公共前缀 + 两问, 开/关 enable_prefix_caching × 两模式。
 # 验证 ①开关不改输出文本 ②开缓存后第二问耗时大跌(命中证据)。
 export HF_HOME=/root/autodl-tmp/hf UV_CACHE_DIR=/root/autodl-tmp/uv-cache
 export VLLM_ATTENTION_BACKEND=FLASH_ATTN VLLM_USE_FLASHINFER_SAMPLER=0
@@ -23,12 +23,10 @@ run() {
 }
 run native_off "" auto 0
 run native_on "" auto 1
-run static_off int8_static_per_channel auto 0
-run static_on int8_static_per_channel auto 1
-run phys_off int8_phys_per_channel int8 0
-run phys_on int8_phys_per_channel int8 1
+run static_off int8_static_per_channel int8 0
+run static_on int8_static_per_channel int8 1
 echo "===== VERDICTS ====="
-for m in native static phys; do
+for m in native static; do
   grep -h "^TIME_" $EV/PC_${m}_off.out | sed "s/^/[$m off] /"
   grep -h "^TIME_" $EV/PC_${m}_on.out | sed "s/^/[$m on ] /"
   if diff <(grep "^TEXT_" $EV/PC_${m}_off.out) <(grep "^TEXT_" $EV/PC_${m}_on.out) >/dev/null 2>&1; then

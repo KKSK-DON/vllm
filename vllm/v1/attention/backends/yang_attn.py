@@ -2,38 +2,44 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """PyTorch paged attention with int8 KV cache quantization.
 
-Which variant runs is chosen by the ``YANG_ATTN_MODE`` environment variable.
-The mode names encode three independent choices.
+Which variant runs is chosen by the ``YANG_ATTN_MODE`` environment variable:
 
-1. **Where the quantization scale comes from.**
-   ``dynamic`` recomputes it every step from the tokens currently in the cache.
-   That is correct but expensive: the work in one decode step grows with the
-   context length, so a whole run costs O(context^2).
-   ``calibration file`` measures it once offline and afterwards only reads it.
+``bf16``
+    This same PyTorch attention on the untouched cache. Exists to prove that
+    the plumbing matches the native kernel before any quantization enters.
 
-2. **What the KV cache pool physically stores.** Either the bf16 original
-   values, converted to int8 again on every read, or int8 values converted once
-   when the token is written. Only the second option halves cache memory.
+``calibrate``
+    ``bf16`` plus the observation hook in ``flash_attn.py`` that records the
+    largest magnitudes on the write path and produces the calibration file.
 
-3. **How much data one scale covers (granularity).** ``per_channel`` keeps one
-   scale per (kv head, channel); ``per_head`` keeps one scale per kv head.
+``int8_per_channel`` / ``int8_per_head``
+    **Dynamic** quantization. The scale is recomputed every step from the
+    tokens this batch references, the pool keeps bf16, and values are
+    converted to int8 again on every read. Correct but expensive: the work in
+    one decode step grows with the context length, so a whole run costs
+    O(context^2). Saves no memory.
 
-The first two axes give the three generations of this project:
+``int8_static_per_channel`` / ``int8_static_per_head``
+    **Static** quantization. The scale was measured once offline (the
+    calibration file), the pool itself is torch.int8 (requires
+    ``kv_cache_dtype=int8``), and every value is quantized exactly once, when
+    it is written. Halves cache memory, and reads cost nothing but a multiply.
 
-==================  ===========================  ==========================
-scale source        bf16 pool                    int8 pool
-==================  ===========================  ==========================
-dynamic             ``int8_per_channel``         impossible: a scale that
-                    ``int8_per_head``            changes every step cannot
-                                                 decode earlier values
-calibration file    ``int8_static_per_channel``  ``int8_phys_per_channel``
-                    ``int8_static_per_head``     ``int8_phys_per_head``
-==================  ===========================  ==========================
+The suffix picks the granularity: ``per_channel`` keeps one scale per
+(kv head, channel), ``per_head`` one per kv head.
 
-Two more modes carry no quantization at all. ``bf16`` runs this same PyTorch
-attention on the untouched cache and exists to prove that the plumbing matches
-the native kernel. ``calibrate`` is ``bf16`` plus the observation hook in
-``flash_attn.py`` that produces the calibration file.
+A static scale is what makes the int8 pool possible at all: a scale that
+changes every step could not decode values stored under yesterday's scale,
+which is why no dynamic int8-pool mode exists.
+
+During development a third family sat between these two: calibrated scales
+with the pool still in bf16, requantizing on every read. It existed to prove
+the calibrated scales alone lose no accuracy, and then as a bit-exact
+reference while the int8 pool was brought up (both were required to produce
+identical outputs, and did). It lives on in the ``feature/int8-kvcache``
+branch (there the int8-pool modes are named ``int8_phys_*``) and is removed
+here, because the int8-pool mode is equal in accuracy and strictly better in
+memory and speed.
 """
 
 import os
@@ -69,8 +75,6 @@ SUPPORTED_MODES = (
     "int8_per_head",
     "int8_static_per_channel",
     "int8_static_per_head",
-    "int8_phys_per_channel",
-    "int8_phys_per_head",
 )
 
 _last_logged_mode_name: str | None = None
@@ -91,7 +95,7 @@ class QuantizationMode:
     quantizes_kv: bool
     # "none", "dynamic" or "calibration_file".
     scale_source: str
-    # True only for the int8_phys_* modes, where the pool is torch.int8.
+    # True for the int8_static_* modes, where the pool is torch.int8.
     cache_holds_int8: bool
     # "per_channel", "per_head", or None when nothing is quantized.
     granularity: str | None
@@ -133,9 +137,12 @@ def parse_mode(mode_name: str) -> QuantizationMode:
     if prefix == "int8":
         scale_source, cache_holds_int8 = "dynamic", False
     elif prefix == "int8_static":
-        scale_source, cache_holds_int8 = "calibration_file", False
-    elif prefix == "int8_phys":
         scale_source, cache_holds_int8 = "calibration_file", True
+    elif prefix == "int8_phys":
+        raise ValueError(
+            f"YANG_ATTN_MODE {mode_name!r} was renamed on this branch: the "
+            "int8_phys_* modes are now called int8_static_*"
+        )
     else:
         raise ValueError(
             f"Unsupported YANG_ATTN_MODE {mode_name!r}; expected one of "
@@ -379,7 +386,7 @@ def paged_attention_int8_matmul(
     while the scale is attached to channels, so the scale is constant across
     that sum either way.
 
-    ``cache_holds_int8`` says the pool already stores int8 (the physical
+    ``cache_holds_int8`` says the pool already stores int8 (the static
     modes), so the conversion step is skipped entirely.
     """
     assert granularity in REDUCE_DIMS_FOR_GRANULARITY, granularity
@@ -458,7 +465,7 @@ def paged_attention_int8_matmul(
 
 
 # --------------------------------------------------------------------------
-# Calibrated scales and the physical int8 write path
+# Calibrated scales and the int8-pool write path
 # --------------------------------------------------------------------------
 
 
@@ -489,7 +496,7 @@ def load_calibrated_scales(
     if _calibration_file_contents is None:
         path = os.environ.get("YANG_KV_SCALE_PATH")
         assert path and os.path.exists(path), (
-            "the int8_static_* and int8_phys_* modes need YANG_KV_SCALE_PATH "
+            "the int8_static_* modes need YANG_KV_SCALE_PATH "
             "pointing at a calibration file"
         )
         _calibration_file_contents = torch.load(path, map_location="cpu")
@@ -515,7 +522,7 @@ def write_int8_kv_cache(
     kv_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
 ) -> None:
-    """Write path for the physical int8 modes, replacing the native kernel.
+    """Write path for the static (int8-pool) modes, replacing the native kernel.
 
     With ``kv_cache_dtype=int8`` the pool is allocated as torch.int8, so the
     new tokens are quantized here, once, and the int8 values are what the pool

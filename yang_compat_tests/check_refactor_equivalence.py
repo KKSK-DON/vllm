@@ -228,7 +228,8 @@ for mode_name in current.SUPPORTED_MODES:
     assert current.parse_mode(mode_name).name == mode_name
 print(f"OK    parse_mode accepts all {len(current.SUPPORTED_MODES)} documented modes")
 
-for malformed in ("", "int8", "int8_per_tensor", "typo_per_head"):
+rejected = ("", "int8", "int8_per_tensor", "typo_per_head", "int8_phys_per_channel")
+for malformed in rejected:
     try:
         current.parse_mode(malformed)
     except ValueError:

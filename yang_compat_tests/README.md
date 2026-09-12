@@ -5,6 +5,11 @@
 `int8_static_*` / `int8_phys_*` 在它们之下依然无损。详细结果记录在
 `KV_CACHE_QUANTIZATION.md` 附录 F.6 / F.7;本目录是可复跑的测试本体。
 
+> **本分支(`int8-kvcache-pretty-cc`)的模式名与下文历史记录不同**:`int8_phys_*` 已改名为
+> `int8_static_*`(int8 池,需要 `kv_cache_dtype=int8`),原来"校准 scale + bf16 池"的
+> 模拟档已删除(完整保留在 `feature/int8-kvcache` 分支)。下文的实验记录按当时的旧名书写,
+> 保持历史原貌;本目录的 `.sh` 脚本已改用新名,阶梯相应少了一级。
+
 ## 文件清单
 
 | 文件 | 角色 |

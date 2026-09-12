@@ -1303,7 +1303,7 @@ class FlashAttentionImpl(AttentionImpl):
 
             yang_mode = parse_mode(yang_mode_name)
 
-        # The physical int8 modes own the write entirely: they quantize the new
+        # The static int8 modes own the write entirely: they quantize the new
         # tokens and store int8, so the native store below must not also run.
         if yang_mode is not None and yang_mode.cache_holds_int8:
             from vllm.v1.attention.backends.yang_attn import write_int8_kv_cache
@@ -1317,7 +1317,7 @@ class FlashAttentionImpl(AttentionImpl):
         if self.kv_cache_dtype == "int8":
             raise NotImplementedError(
                 "kv_cache_dtype=int8 has no native write kernel; run with "
-                "YANG_ATTN_MODE=int8_phys_per_channel or int8_phys_per_head"
+                "YANG_ATTN_MODE=int8_static_per_channel or int8_static_per_head"
             )
 
         # Scatter write into the KV cache using slot_mapping indices.
