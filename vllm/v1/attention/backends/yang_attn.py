@@ -379,7 +379,9 @@ def yang_forward(
     assert self.alibi_slopes is None
     assert self.sinks is None
     assert attn_metadata.causal is True
-    assert attn_metadata.sliding_window in (None, (-1, -1))
+    # Upstream 513f83e7ec removed FlashAttentionMetadata.sliding_window (the
+    # window now comes from the layer itself), so the layer-side check below
+    # is the whole guard.
     assert self.sliding_window == (-1, -1)
     if yang_mode.startswith("int8_phys"):
         assert self.kv_cache_dtype == "int8", (
@@ -387,7 +389,8 @@ def yang_forward(
         )
     else:
         assert self.kv_cache_dtype == "auto"
-    assert attn_metadata.mm_prefix_range_tensor is None
+    # Renamed from mm_prefix_range_tensor by upstream 66b3c0e61f.
+    assert attn_metadata.mm_prefix_query_range_tensor is None
     assert attn_metadata.rswa_prefix_lens is None
 
     cu_seqlens_q = attn_metadata.query_start_loc  # prefix sum
