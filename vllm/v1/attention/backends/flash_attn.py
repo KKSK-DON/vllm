@@ -827,7 +827,11 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
 
 class FlashAttentionImpl(AttentionImpl):
     can_return_lse_for_decode: bool = True
-    _calib_amax: ClassVar[dict[str, dict[str, torch.Tensor]]] = {}
+
+    # Calibration statistics, shared by every attention layer's instance:
+    # layer name -> table name -> running maximum magnitude. Declared on the
+    # class on purpose, see _record_calibration_maxima.
+    _calibration_maxima: ClassVar[dict[str, dict[str, torch.Tensor]]] = {}
 
     def __init__(
         self,
@@ -1200,44 +1204,84 @@ class FlashAttentionImpl(AttentionImpl):
         )
         return output
 
-    def _calibrate_observe(
+    def _record_calibration_maxima(
         self,
         layer_name: str,
         key: torch.Tensor,
         value: torch.Tensor,
         slot_mapping: torch.Tensor,
     ) -> None:
+        """Track the largest magnitude ever seen, per (kv head, channel).
+
+        This sits on the write path, ahead of the native store, so every value
+        is looked at exactly once in its life. Measuring on the read path
+        instead would rescan the whole history on every decode step.
+
+        `key` and `value` are buffers reused across steps, and their tails can
+        still hold data from an earlier, larger batch. `slot_mapping` carries
+        exactly one entry per real new token, so its length marks where the
+        real data ends.
+
+        A running maximum only ever grows, which is what lets one pass stand in
+        for a full rescan: the maximum over everything is the maximum of what
+        was already recorded and what just arrived.
+        """
         path = os.environ.get("YANG_KV_SCALE_PATH")
         assert path, "calibrate mode requires YANG_KV_SCALE_PATH"
-        entry = self._calib_amax.setdefault(layer_name, {})
-        changed = False
-        for table_name, cache in (("k_amax", key), ("v_amax", value)):
-            real = cache[: slot_mapping.shape[0]]
-            new = real.abs().float().amax(dim=(0,), keepdim=True)
-            old = entry.get(table_name)
-            if old is None:
-                entry[table_name] = new
-                changed = True
-            else:
-                merged = torch.maximum(old, new)
-                if not torch.equal(merged, old):
-                    entry[table_name] = merged
-                    changed = True
-        if changed:
-            snapshot = {}
-            for layer, tables in self._calib_amax.items():
-                saved = {table_name: t.cpu() for table_name, t in tables.items()}
-                # everything derivable is derived here, offline: per_head tables
-                # and ready-to-use scales, so eval runs purely read the file
-                saved["k_amax_per_head"] = saved["k_amax"].amax(dim=-1, keepdim=True)
-                saved["v_amax_per_head"] = saved["v_amax"].amax(dim=-1, keepdim=True)
-                for amax_name in list(saved):
-                    scale_name = amax_name.replace("amax", "scale")
-                    saved[scale_name] = saved[amax_name].clamp(min=1e-6) / 127
-                snapshot[layer] = saved
-            tmp = path + ".tmp"
-            torch.save(snapshot, tmp)
-            os.replace(tmp, path)
+
+        # _calibration_maxima belongs to the class, not to the instance, so all
+        # attention layers share one record. Were it per instance, each layer
+        # would save a file holding only itself and overwrite the others. For
+        # the same reason everything below mutates the dict in place: assigning
+        # to self._calibration_maxima would hide the shared one behind a new
+        # instance attribute.
+        layer_maxima = self._calibration_maxima.setdefault(layer_name, {})
+
+        grew = False
+        for table_name, new_values in (("k_amax", key), ("v_amax", value)):
+            real_tokens = new_values[: slot_mapping.shape[0]]
+            batch_maximum = real_tokens.abs().float().amax(dim=(0,), keepdim=True)
+            recorded_maximum = layer_maxima.get(table_name)
+            if recorded_maximum is None:
+                layer_maxima[table_name] = batch_maximum
+                grew = True
+                continue
+            merged = torch.maximum(recorded_maximum, batch_maximum)
+            if not torch.equal(merged, recorded_maximum):
+                layer_maxima[table_name] = merged
+                grew = True
+
+        if grew:
+            self._save_calibration_file(path)
+
+    def _save_calibration_file(self, path: str) -> None:
+        """Write every layer's tables out, deriving now whatever can be derived.
+
+        The per-head tables and the scales themselves are computed here instead
+        of at inference time, so an evaluation run does nothing but read. The
+        measured magnitudes are kept next to the scales so the scales can be
+        re-derived under a different rule without rerunning calibration.
+
+        The file is written under a temporary name and then renamed, because
+        os.replace is atomic: a reader sees either the whole previous file or
+        the whole new one, never a half-written one.
+        """
+        # 127 and 1e-6 must match LARGEST_INT8_MAGNITUDE and MIN_SCALE in
+        # yang_attn.py; they are repeated rather than imported to keep this
+        # module free of an import cycle.
+        snapshot = {}
+        for layer_name, tables in self._calibration_maxima.items():
+            saved = {name: tensor.cpu() for name, tensor in tables.items()}
+            saved["k_amax_per_head"] = saved["k_amax"].amax(dim=-1, keepdim=True)
+            saved["v_amax_per_head"] = saved["v_amax"].amax(dim=-1, keepdim=True)
+            for magnitude_name in list(saved):
+                scale_name = magnitude_name.replace("amax", "scale")
+                saved[scale_name] = saved[magnitude_name].clamp(min=1e-6) / 127
+            snapshot[layer_name] = saved
+
+        temporary_path = path + ".tmp"
+        torch.save(snapshot, temporary_path)
+        os.replace(temporary_path, path)
 
     def do_kv_cache_update(
         self,
@@ -1252,23 +1296,38 @@ class FlashAttentionImpl(AttentionImpl):
             # we use direct Q, K, V tensors without caching
             return
 
-        yang_mode = os.environ.get("YANG_ATTN_MODE", "")
-        if yang_mode.startswith("int8_phys"):
-            from vllm.v1.attention.backends.yang_attn import yang_static_write
+        yang_mode_name = os.environ.get("YANG_ATTN_MODE", "")
+        yang_mode = None
+        if yang_mode_name:
+            from vllm.v1.attention.backends.yang_attn import parse_mode
 
-            yang_static_write(layer, key, value, kv_cache, slot_mapping)
+            yang_mode = parse_mode(yang_mode_name)
+
+        # The physical int8 modes own the write entirely: they quantize the new
+        # tokens and store int8, so the native store below must not also run.
+        if yang_mode is not None and yang_mode.cache_holds_int8:
+            from vllm.v1.attention.backends.yang_attn import write_int8_kv_cache
+
+            write_int8_kv_cache(layer, key, value, kv_cache, slot_mapping)
             return
+
+        # Reaching here with an int8 pool means the mode and the pool dtype
+        # disagree. Failing now beats letting the native store write bf16 bytes
+        # into int8 storage, which would corrupt the cache silently.
         if self.kv_cache_dtype == "int8":
             raise NotImplementedError(
                 "kv_cache_dtype=int8 has no native write kernel; run with "
                 "YANG_ATTN_MODE=int8_phys_per_channel or int8_phys_per_head"
             )
+
         # Scatter write into the KV cache using slot_mapping indices.
         # No TMA kernel is invoked here, so stride canonicalization is not needed.
         # (B, H, N, 2*D) -> ((B, N, H, D), (B, N, H, D))
         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
-        if yang_mode == "calibrate":
-            self._calibrate_observe(layer.layer_name, key, value, slot_mapping)
+
+        # Calibration only observes; the native store still runs below.
+        if yang_mode is not None and yang_mode.observes_calibration:
+            self._record_calibration_maxima(layer.layer_name, key, value, slot_mapping)
         # Reshape the input keys and values and store them in the cache.
         # Skip this if sharing KV cache with an earlier attention layer.
         # NOTE(woosuk): Here, key and value are padded while slot_mapping is

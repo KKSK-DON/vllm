@@ -13,6 +13,27 @@
 | `chunk_test.sh` | 切块跑批:四场阶梯 + 提取纯文本 + 三级 diff |
 | `prefix_cache_probe.py` | 前缀缓存探针:7.5k 公共前缀 + 两个问题串行提交,打 `TIME_`/`TEXT_` 标记行 |
 | `prefix_test.sh` | 前缀缓存跑批:开/关 × 三模式共 6 场 + 双判据裁决 |
+| `check_refactor_equivalence.py` | 重构前后逐位对拍,纯 CPU 一秒跑完,不需要 GPU |
+
+## 重构对拍:`check_refactor_equivalence.py`
+
+`int8-kvcache-pretty-cc` 分支只改可读性,不许改任何数字。这个脚本把重构前后的
+`yang_attn.py` 同时当成两个模块加载(里面的 vllm 依赖用桩替换,因为被比较的函数只需要
+torch),喂同一组随机输入,要求每个输出 `torch.equal` 逐位相同:
+
+```bash
+.venv/bin/python yang_compat_tests/check_refactor_equivalence.py
+.venv/bin/python yang_compat_tests/check_refactor_equivalence.py <基线分支或提交>
+```
+
+覆盖 15 项:两种粒度的动态 scale、per-tensor 量化、bf16 注意力(含 soft_cap 和滑动窗口)、
+int8 注意力(两种粒度 × bf16 池/int8 池 × 带不带滑动窗口)、以及模式名解析(8 个合法模式
+全部接受,4 个畸形模式全部拒绝)。输入刻意选成 GQA(4 个 query 头配 2 个 KV 头)、
+上下文长度都不是块大小的整数倍(逼出未写满的块尾)、并且混合了预填充段和解码段。
+
+为什么判据是"逐位相同"而不是"误差很小":物理模式和静态模式必须输出完全一致,这是本项目
+最强的正确性判据(见 `KV_CACHE_QUANTIZATION.md` 附录 F.2)。重构哪怕只动了一次浮点乘法的
+结合顺序,这个判据就失效了。
 
 ## 测试一:chunked prefill(分块预填充)
 
